@@ -310,6 +310,9 @@ pub fn shfill(ip: &mut Interp) -> R {
 /// Fill `path` with the current shading pattern; false when the pattern isn't a shading.
 pub fn fill_pattern(ip: &mut Interp, path: &[Seg], eo: bool) -> R<bool> {
     let Some(p) = ip.gs.pattern.clone() else { return Ok(false) };
+    if p.get_name(b"PatternType").and_then(|o| o.num()) == Some(1.0) {
+        return tiling(ip, &p, path, eo).map(|()| true);
+    }
     if p.get_name(b"PatternType").and_then(|o| o.num()) != Some(2.0) {
         return Ok(false);
     }
@@ -321,4 +324,61 @@ pub fn fill_pattern(ip: &mut Interp, path: &[Seg], eo: bool) -> R<bool> {
     let Some(s) = build(ip, &sh)? else { return Ok(true) };
     ip.out.shade(&ip.gs.clip, Some(path), eo, &m, s).map_err(PsErr::Fatal)?;
     Ok(true)
+}
+
+/// Fill with a tiling pattern: its cell painted once (per colour, for an uncoloured one) into a
+/// PDF tiling pattern, cached on the pattern.
+fn tiling(ip: &mut Interp, p: &PDict, path: &[Seg], eo: bool) -> R {
+    let uncolored = p.get_name(b"PaintType").and_then(|o| o.num()) == Some(2.0);
+    let color = if uncolored { Some(ip.gs.color.clone()) } else { None };
+    let key = (crate::obj::Obj::Dict(p.clone()).key(), color.clone().unwrap_or_default().iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    let n = match ip.cells.get(&key) {
+        Some(n) => *n,
+        None => {
+            let n = cell(ip, p, color)?;
+            if ip.cells.len() < 10_000 {
+                ip.cells.insert(key, n);
+            }
+            n
+        }
+    };
+    ip.out.fill_tiling(&ip.gs.clip, path, eo, n).map_err(PsErr::Fatal)
+}
+
+fn cell(ip: &mut Interp, p: &PDict, color: Option<Vec<f64>>) -> R<usize> {
+    let bbox = nums(p.get_name(b"BBox")).filter(|b| b.len() == 4).map(|b| [b[0], b[1], b[2], b[3]]).ok_or(PsErr::Ps("rangecheck"))?;
+    let num = |k: &[u8]| p.get_name(k).and_then(|o| o.num());
+    let step = (num(b"XStep").unwrap_or(bbox[2] - bbox[0]), num(b"YStep").unwrap_or(bbox[3] - bbox[1]));
+    if step.0 == 0.0 || step.1 == 0.0 || !step.0.is_finite() || !step.1.is_finite() {
+        return err("rangecheck");
+    }
+    let m = match p.get_name(b"DesignCraftMatrix") {
+        Some(Obj::Array(a, _)) => matrix_of(&a)?,
+        _ => M::ID,
+    };
+    let paint = p.get_name(b"PaintProc").ok_or(PsErr::Ps("undefined"))?;
+    let under = ip.gs.pattern_base.as_deref().cloned();
+    let cap = ip.out.begin_cell();
+    ip.gsave()?;
+    // The cell is drawn in pattern space, unclipped, from a fresh path.
+    ip.gs.ctm = M::ID;
+    ip.gs.clip = None;
+    ip.gs.path.clear();
+    ip.gs.cur = None;
+    ip.gs.nulldev = false;
+    if let Some(c) = color {
+        // An uncoloured cell paints in the colour given with the pattern.
+        ip.gs.space = under.unwrap_or(match c.len() {
+            3 => crate::gstate::Space::Rgb,
+            4 => crate::gstate::Space::Cmyk,
+            _ => crate::gstate::Space::Gray,
+        });
+        ip.gs.color = c;
+        ip.gs.pattern = None;
+        ip.gs.color_locked = true;
+    }
+    let r = ip.push(Obj::Dict(p.clone())).and_then(|()| ip.call(paint));
+    ip.grestore();
+    let n = ip.out.end_cell(cap, bbox, step, m).map_err(PsErr::Fatal)?;
+    r.map(|()| n)
 }

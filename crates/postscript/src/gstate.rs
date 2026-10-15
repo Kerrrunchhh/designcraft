@@ -192,6 +192,10 @@ pub struct GState {
     pub stroke_adjust: bool,
     /// Clips saved by `clipsave`.
     pub clip_saves: Vec<Option<Rc<Clip>>>,
+    /// The colour space under an uncoloured pattern (`[/Pattern /DeviceRGB]`).
+    pub pattern_base: Option<Box<Space>>,
+    /// Inside an uncoloured pattern's PaintProc: colour operators are ignored.
+    pub color_locked: bool,
     /// Painting goes nowhere (`nulldevice`, measuring glyphs).
     pub nulldev: bool,
     /// Glyph widths reported by `setcharwidth`/`setcachedevice` while a glyph runs.
@@ -219,6 +223,8 @@ impl Default for GState {
             overprint: false,
             stroke_adjust: false,
             clip_saves: Vec::new(),
+            color_locked: false,
+            pattern_base: None,
             nulldev: false,
             char_width: None,
         }

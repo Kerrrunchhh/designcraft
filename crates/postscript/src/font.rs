@@ -48,6 +48,9 @@ pub fn find_font(ip: &mut Interp, key: &Obj) -> PDict {
         return d;
     }
     let n = crate::ops::basic::text_of(key);
+    if let Some(d) = crate::composite::compose_by_name(ip, &n) {
+        return d;
+    }
     let d = substitute(ip, &n);
     ip.fontdir.put(key.clone(), Obj::Dict(d.clone()));
     d
@@ -174,7 +177,13 @@ fn outline(ip: &mut Interp, font: &PDict, code: u8) -> Option<std::rc::Rc<crate:
     if let Some(hit) = ip.glyphs.get(&(fid, g.clone())) {
         return Some(hit.clone());
     }
-    let glyph = if font.get_name(b"FontType").and_then(|o| o.num()) == Some(42.0) {
+    let glyph = if let Some((set, k)) = crate::composite::cff_of(ip, font) {
+        let gid = match font.get_name(b"CharStrings") {
+            Some(Obj::Dict(cs)) => cs.get(&Key::Name(name(&g))).and_then(|o| o.num()).map_or(0, |v| v as u32),
+            _ => 0,
+        };
+        std::rc::Rc::new(set.glyph(k, gid)?)
+    } else if font.get_name(b"FontType").and_then(|o| o.num()) == Some(42.0) {
         let data = match ip.sfnts.get(&fid) {
             Some(d) => d.clone(),
             None => {
@@ -196,11 +205,28 @@ fn outline(ip: &mut Interp, font: &PDict, code: u8) -> Option<std::rc::Rc<crate:
     Some(glyph)
 }
 
-/// Where a glyph at the current point lands: glyph space → device space.
-fn glyph_to_device(ip: &Interp, font: &PDict) -> R<M> {
+/// A CID's glyph in a CIDFont (cached by font and CID).
+fn cid_outline(ip: &mut Interp, font: &PDict, cid: u32) -> Option<std::rc::Rc<crate::type1::Glyph>> {
+    let fid = match font.get_name(b"FID") {
+        Some(Obj::FontId(f)) => f,
+        _ => 0,
+    };
+    let key = (fid, format!("\0cid{cid}").into_bytes());
+    if let Some(hit) = ip.glyphs.get(&key) {
+        return Some(hit.clone());
+    }
+    let g = std::rc::Rc::new(crate::composite::cid_glyph(ip, font, cid)?);
+    if ip.glyphs.len() < 100_000 {
+        ip.glyphs.insert(key, g.clone());
+    }
+    Some(g)
+}
+
+/// Where a glyph at the current point lands: glyph space (through `fm`) → device space.
+fn glyph_to_device(ip: &Interp, fm: &M) -> R<M> {
     let (x, y) = ip.gs.cur.ok_or(PsErr::Ps("nocurrentpoint"))?;
     let (ux, uy) = ip.gs.ctm.inv().ok_or(PsErr::Ps("undefinedresult"))?.apply(x, y);
-    Ok(font_matrix(font).then(&M([1.0, 0.0, 0.0, 1.0, ux, uy])).then(&ip.gs.ctm))
+    Ok(fm.then(&M([1.0, 0.0, 0.0, 1.0, ux, uy])).then(&ip.gs.ctm))
 }
 
 /// Run one Type 3 glyph at the current point: its advance in glyph space.
@@ -230,48 +256,70 @@ fn type3_glyph(ip: &mut Interp, font: &PDict, code: u8) -> R<(f64, f64)> {
 }
 
 /// Show (or, with `draw` false, measure) a string: the total advance in user space.
-fn show_string(ip: &mut Interp, s: &[u8], draw: bool, per_char: &mut dyn FnMut(&mut Interp, u8, usize) -> R<(f64, f64)>) -> R<(f64, f64)> {
+/// `per_char` gives each glyph's extra displacement (or, with `replace`, its whole advance).
+fn show_glyphs(
+    ip: &mut Interp,
+    s: &[u8],
+    draw: bool,
+    replace: bool,
+    per_char: &mut dyn FnMut(&mut Interp, u32, usize) -> R<(f64, f64)>,
+) -> R<(f64, f64)> {
     let font = match ip.gs.font.clone() {
         Some(f) => f,
         None => return err("invalidfont"),
     };
-    let fm = font_matrix(&font);
-    let type3 = font.get_name(b"FontType").and_then(|o| o.num()) == Some(3.0);
+    let jobs: Vec<(u32, PDict, M, crate::composite::Key2)> = if font.get_name(b"FontType").and_then(|o| o.num()) == Some(0.0) {
+        crate::composite::decode(ip, &font, s)?
+    } else {
+        let fm = font_matrix(&font);
+        s.iter().map(|c| (u32::from(*c), font.clone(), fm, crate::composite::Key2::Code(*c))).collect()
+    };
     let mut total = (0.0, 0.0);
-    for (i, &code) in s.iter().enumerate() {
-        let w = if type3 {
-            if draw && ip.gs.cur.is_some() {
-                type3_glyph(ip, &font, code)?
-            } else {
-                let saved = ip.gs.nulldev;
-                ip.gs.nulldev = true;
-                if ip.gs.cur.is_none() {
-                    ip.gs.cur = Some((0.0, 0.0));
-                }
-                let w = type3_glyph(ip, &font, code);
-                ip.gs.nulldev = saved;
-                w?
-            }
-        } else if let Some(g) = outline(ip, &font, code) {
-            if draw && !g.path.is_empty() && ip.gs.cur.is_some() {
-                let m = glyph_to_device(ip, &font)?;
-                let path: Vec<crate::gstate::Seg> = g.path.iter().map(|s| s.map(&m)).collect();
-                if ip.charpath {
-                    ip.gs.path.extend(path);
+    for (i, (code, leaf, fm, key)) in jobs.into_iter().enumerate() {
+        let type3 = leaf.get_name(b"FontType").and_then(|o| o.num()) == Some(3.0);
+        let w = match key {
+            crate::composite::Key2::Code(c) if type3 => {
+                if draw && ip.gs.cur.is_some() {
+                    type3_glyph(ip, &leaf, c)?
                 } else {
-                    crate::ops::gfx::fill_path(ip, &path, false)?;
+                    let saved = ip.gs.nulldev;
+                    ip.gs.nulldev = true;
+                    if ip.gs.cur.is_none() {
+                        ip.gs.cur = Some((0.0, 0.0));
+                    }
+                    let w = type3_glyph(ip, &leaf, c);
+                    ip.gs.nulldev = saved;
+                    w?
                 }
             }
-            match font.get_name(b"Metrics") {
-                Some(_) => estimated_width(&font, code),
-                None => g.width,
+            key => {
+                let g = match key {
+                    crate::composite::Key2::Code(c) => outline(ip, &leaf, c),
+                    crate::composite::Key2::Cid(cid) => cid_outline(ip, &leaf, cid),
+                };
+                match g {
+                    Some(g) => {
+                        if draw && !g.path.is_empty() && ip.gs.cur.is_some() {
+                            let m = glyph_to_device(ip, &fm)?;
+                            let path: Vec<crate::gstate::Seg> = g.path.iter().map(|s| s.map(&m)).collect();
+                            if ip.charpath {
+                                ip.gs.path.extend(path);
+                            } else {
+                                crate::ops::gfx::fill_path(ip, &path, false)?;
+                            }
+                        }
+                        match (leaf.get_name(b"Metrics"), key_code(code)) {
+                            (Some(_), Some(c)) => estimated_width(&leaf, c),
+                            _ => g.width,
+                        }
+                    }
+                    None => estimated_width(&leaf, key_code(code).unwrap_or(0)),
+                }
             }
-        } else {
-            estimated_width(&font, code)
         };
         let (wx, wy) = fm.delta(w.0, w.1);
         let (ex, ey) = per_char(ip, code, i)?;
-        let (dx, dy) = (wx + ex, wy + ey);
+        let (dx, dy) = if replace { (ex, ey) } else { (wx + ex, wy + ey) };
         total = (total.0 + dx, total.1 + dy);
         if draw && let Some((cx, cy)) = ip.gs.cur {
             let (ddx, ddy) = ip.gs.ctm.delta(dx, dy);
@@ -279,6 +327,14 @@ fn show_string(ip: &mut Interp, s: &[u8], draw: bool, per_char: &mut dyn FnMut(&
         }
     }
     Ok(total)
+}
+
+fn key_code(code: u32) -> Option<u8> {
+    u8::try_from(code).ok()
+}
+
+fn show_string(ip: &mut Interp, s: &[u8], draw: bool, per_char: &mut dyn FnMut(&mut Interp, u32, usize) -> R<(f64, f64)>) -> R<(f64, f64)> {
+    show_glyphs(ip, s, draw, false, per_char)
 }
 
 pub fn show(ip: &mut Interp) -> R {
@@ -318,27 +374,24 @@ pub fn awidthshow(ip: &mut Interp) -> R {
 fn explicit_show(ip: &mut Interp, xs: bool, ys: bool) -> R {
     let disp: Vec<f64> = match ip.pop()? {
         Obj::Array(a, _) => a.items().iter().filter_map(Obj::num).collect(),
-        Obj::Str(_, _) => return err("typecheck"),
+        // An encoded number string is rare in EPS: the glyphs' own widths then.
+        Obj::Str(_, _) => Vec::new(),
         _ => return err("typecheck"),
     };
     let s = ip.pop_str()?.bytes();
+    if ip.gs.cur.is_none() {
+        return err("nocurrentpoint");
+    }
     let step = if xs && ys { 2 } else { 1 };
-    let saved_cur = ip.gs.cur;
-    let mut cur = saved_cur.ok_or(PsErr::Ps("nocurrentpoint"))?;
-    for (i, c) in s.iter().enumerate() {
-        ip.gs.cur = Some(cur);
-        show_string(ip, &[*c], true, &mut |_, _, _| Ok((0.0, 0.0)))?;
+    show_glyphs(ip, &s, true, true, &mut |_, _, i| {
         let d = |k: usize| disp.get(i * step + k).copied().unwrap_or(0.0);
-        let (dx, dy) = match (xs, ys) {
+        Ok(match (xs, ys) {
             (true, true) => (d(0), d(1)),
             (true, false) => (d(0), 0.0),
             _ => (0.0, d(0)),
-        };
-        let (ddx, ddy) = ip.gs.ctm.delta(dx, dy);
-        cur = (cur.0 + ddx, cur.1 + ddy);
-    }
-    ip.gs.cur = Some(cur);
-    Ok(())
+        })
+    })
+    .map(|_| ())
 }
 
 pub fn xshow(ip: &mut Interp) -> R {

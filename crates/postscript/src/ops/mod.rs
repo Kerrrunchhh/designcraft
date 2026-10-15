@@ -7,9 +7,9 @@ pub mod mesh;
 pub mod misc;
 pub mod shading;
 
-use crate::font;
 use crate::interp::{Interp, R};
 use crate::obj::{Obj, PArr, PDict};
+use crate::{composite, font};
 
 pub type OpId = u16;
 pub type OpFn = fn(&mut Interp) -> R;
@@ -133,6 +133,16 @@ pub static OPS: &[(&[u8], OpFn)] = named! {
     "setucacheparams" => misc::noop, "ucachestatus" => misc::noop, "setobjectformat" => misc::pop1,
     "currentobjectformat" => misc::zero, "sethalftonephase" => misc::setbbox, "echo" => misc::pop1,
     "prompt" => misc::noop, "executive" => misc::noop, "start" => misc::noop,
+    // CFF font sets, CMaps and composite fonts
+    "StartData" => composite::startdata, "composefont" => composite::composefont,
+    "begincmap" => composite::begincmap, "endcmap" => composite::endcmap, "usecmap" => composite::usecmap,
+    "begincodespacerange" => composite::begin_block, "endcodespacerange" => composite::endcodespacerange,
+    "begincidrange" => composite::begin_block, "endcidrange" => composite::endcidrange,
+    "begincidchar" => composite::begin_block, "endcidchar" => composite::endcidchar,
+    "beginbfchar" => composite::begin_block, "endbfchar" => composite::end_ignored,
+    "beginbfrange" => composite::begin_block, "endbfrange" => composite::end_ignored,
+    "beginnotdefrange" => composite::begin_block, "endnotdefrange" => composite::end_ignored,
+    "beginnotdefchar" => composite::begin_block, "endnotdefchar" => composite::end_ignored,
 };
 
 pub fn op_id(n: &[u8]) -> Option<OpId> {
@@ -212,4 +222,5 @@ pub fn install(ip: &mut Interp) {
     ip.userdict.put_name(b"#copies", Obj::Int(1));
     let cats = PDict::new(4);
     ip.resources.put_name(b"Category", Obj::Dict(cats));
+    composite::install(ip);
 }

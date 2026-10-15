@@ -5,12 +5,15 @@
 //! Written from the PostScript Language Reference (third edition) and the EPS specification.
 //! Covered: the language (Level 3 operators EPS files use), paths, painting, clipping, device and
 //! Separation/DeviceN/Indexed colour, sampled images with the standard filters, smooth shadings
-//! (axial, radial, function-based, triangle and patch meshes) and shading patterns, Type 1,
-//! Type 3 and Type 42 fonts. Not yet: CFF glyphs (text in them advances without drawing) and
-//! tiling patterns (a grey stands in).
+//! (axial, radial, function-based, triangle and patch meshes), shading and tiling patterns, and
+//! text in Type 1, Type 3, Type 42 and CFF fonts (`StartData`), CIDFonts and composite fonts
+//! through CMaps. Not yet: `strokepath`, vertical writing.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod cff;
+mod cff_strings;
+mod composite;
 mod encodings;
 mod font;
 mod gstate;

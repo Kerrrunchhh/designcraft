@@ -130,6 +130,12 @@ pub struct Interp {
     pub next_fid: usize,
     pub main: usize,
     pub warnings: Vec<String>,
+    /// Tiling pattern cells already written, by pattern and colour.
+    pub cells: std::collections::HashMap<(crate::obj::Key, Vec<u64>), usize>,
+    /// CMaps by index (CMap dictionaries refer to them).
+    pub cmaps: Vec<crate::composite::CMap>,
+    /// CFF font sets read by StartData.
+    pub cff: Vec<std::rc::Rc<crate::cff::FontSet>>,
     /// Type 42 fonts' TrueType data by FID.
     pub sfnts: std::collections::HashMap<usize, std::rc::Rc<Vec<u8>>>,
     /// `charpath` is running: glyphs add to the path instead of painting.
@@ -176,6 +182,9 @@ impl Interp {
             glyphs: std::collections::HashMap::new(),
             charpath: false,
             sfnts: std::collections::HashMap::new(),
+            cmaps: Vec::new(),
+            cells: std::collections::HashMap::new(),
+            cff: Vec::new(),
         };
         ops::install(&mut ip);
         ip

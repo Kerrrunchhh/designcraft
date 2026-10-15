@@ -86,6 +86,22 @@ pub struct Shading {
     pub points: Vec<(f64, f64)>,
 }
 
+/// A tiling pattern cell: its content (in pattern space), cell box, steps and pattern matrix.
+pub struct Tiling {
+    content: Vec<u8>,
+    bbox: [f64; 4],
+    step: (f64, f64),
+    matrix: M,
+}
+
+/// What a pattern cell's content replaces while it is captured.
+pub struct Capture {
+    c: Content,
+    applied: Vec<Rc<Clip>>,
+    state: PaintState,
+    saved: Vec<PaintState>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PaintState {
     fill: Option<DevColor>,
@@ -104,6 +120,8 @@ pub struct Out {
     c: Content,
     images: Vec<Image>,
     shadings: Vec<Shading>,
+    tilings: Vec<Tiling>,
+    origin: (f64, f64),
     applied: Vec<Rc<Clip>>,
     state: PaintState,
     saved: Vec<PaintState>,
@@ -124,6 +142,8 @@ impl Out {
             c,
             images: Vec::new(),
             shadings: Vec::new(),
+            tilings: Vec::new(),
+            origin,
             applied: Vec::new(),
             state: PaintState::default(),
             saved: Vec::new(),
@@ -275,6 +295,54 @@ impl Out {
         Ok(())
     }
 
+    /// Start a pattern cell: painting goes to its own content until [`Out::end_cell`].
+    pub fn begin_cell(&mut self) -> Capture {
+        Capture {
+            c: std::mem::replace(&mut self.c, Content::new()),
+            applied: std::mem::take(&mut self.applied),
+            state: std::mem::take(&mut self.state),
+            saved: std::mem::take(&mut self.saved),
+        }
+    }
+
+    /// Finish a pattern cell: its pattern number.
+    pub fn end_cell(&mut self, cap: Capture, bbox: [f64; 4], step: (f64, f64), matrix: M) -> Result<usize, String> {
+        let mut cell = std::mem::replace(&mut self.c, cap.c);
+        for _ in 0..self.applied.len() {
+            cell.restore_state();
+        }
+        self.applied = cap.applied;
+        self.state = cap.state;
+        self.saved = cap.saved;
+        if self.tilings.len() >= MAX_IMAGES {
+            return Err("too many patterns".into());
+        }
+        // Pattern space maps to the page's default space, which the content moved to the origin.
+        let matrix = matrix.then(&M([1.0, 0.0, 0.0, 1.0, -self.origin.0, -self.origin.1]));
+        self.tilings.push(Tiling { content: cell.finish().into_vec(), bbox, step, matrix });
+        Ok(self.tilings.len() - 1)
+    }
+
+    /// Fill a device-space path with tiling pattern `n`.
+    pub fn fill_tiling(&mut self, clip: &Option<Rc<Clip>>, path: &[Seg], eo: bool, n: usize) -> Result<(), String> {
+        if !path.iter().any(|s| !matches!(s, Seg::Move(..))) {
+            return Ok(());
+        }
+        self.sync_clip(clip)?;
+        self.c.set_fill_color_space(pdf_writer::types::ColorSpaceOperand::Pattern);
+        let name = format!("P{n}");
+        self.c.set_fill_pattern(None, Name(name.as_bytes()));
+        self.state.fill = None;
+        self.path(path)?;
+        if eo {
+            self.c.fill_even_odd();
+        } else {
+            self.c.fill_nonzero();
+        }
+        self.painted = true;
+        Ok(())
+    }
+
     /// Paint a shading in shading space `m` (inside `path` too, for a shading pattern fill).
     pub fn shade(&mut self, clip: &Option<Rc<Clip>>, path: Option<&[Seg]>, eo: bool, m: &M, s: Shading) -> Result<(), String> {
         if self.shadings.len() >= MAX_IMAGES {
@@ -322,14 +390,9 @@ impl Out {
         };
         let image_refs: Vec<(Ref, Option<Ref>)> = self.images.iter().map(|i| (alloc(), i.smask.as_ref().map(|_| alloc()))).collect();
         let shading_refs: Vec<(Ref, Ref)> = self.shadings.iter().map(|_| (alloc(), alloc())).collect();
-        pdf.catalog(catalog).pages(pages);
-        pdf.pages(pages).kids([page]).count(1);
-        {
-            let mut p = pdf.page(page);
-            p.parent(pages);
-            p.media_box(Rect::new(0.0, 0.0, f(size.0.max(1.0)), f(size.1.max(1.0))));
-            p.contents(content);
-            let mut res = p.resources();
+        let tiling_refs: Vec<Ref> = self.tilings.iter().map(|_| alloc()).collect();
+        // Every resource is listed for the page and for each pattern cell (names are global).
+        let resources = |res: &mut pdf_writer::writers::Resources<'_>| {
             let mut xo = res.x_objects();
             for (i, (r, _)) in image_refs.iter().enumerate() {
                 let name = format!("Im{i}");
@@ -342,6 +405,22 @@ impl Out {
                 sh.pair(Name(name.as_bytes()), *r);
             }
             sh.finish();
+            let mut pa = res.patterns();
+            for (i, r) in tiling_refs.iter().enumerate() {
+                let name = format!("P{i}");
+                pa.pair(Name(name.as_bytes()), *r);
+            }
+            pa.finish();
+        };
+        pdf.catalog(catalog).pages(pages);
+        pdf.pages(pages).kids([page]).count(1);
+        {
+            let mut p = pdf.page(page);
+            p.parent(pages);
+            p.media_box(Rect::new(0.0, 0.0, f(size.0.max(1.0)), f(size.1.max(1.0))));
+            p.contents(content);
+            let mut res = p.resources();
+            resources(&mut res);
             res.finish();
             p.finish();
         }
@@ -411,6 +490,22 @@ impl Out {
         }
         for (s, (r, fr)) in self.shadings.iter().zip(&shading_refs) {
             write_shading(&mut pdf, s, *r, *fr);
+        }
+        for (t, r) in self.tilings.iter().zip(&tiling_refs) {
+            let z = miniz_oxide::deflate::compress_to_vec_zlib(&t.content, 6);
+            let mut p = pdf.tiling_pattern(*r, &z);
+            p.filter(Filter::FlateDecode);
+            p.paint_type(pdf_writer::types::PaintType::Colored);
+            p.tiling_type(pdf_writer::types::TilingType::ConstantSpacing);
+            let [x0, y0, x1, y1] = t.bbox;
+            p.bbox(Rect::new(f(x0), f(y0), f(x1), f(y1)));
+            p.x_step(f(t.step.0));
+            p.y_step(f(t.step.1));
+            p.matrix(t.matrix.0.map(f));
+            let mut res = p.resources();
+            resources(&mut res);
+            res.finish();
+            p.finish();
         }
         pdf.finish()
     }

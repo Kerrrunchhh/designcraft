@@ -197,3 +197,145 @@ fn type42_fonts_draw_their_truetype_glyphs() {
     // Two outlined glyphs, filled; the second 12 points on (JetBrains Mono advances 600/1000).
     assert_eq!(c.lines().filter(|l| *l == "f").count(), 2, "{}", &c[..c.len().min(400)]);
 }
+
+/// A CFF INDEX of `items` (4-byte offsets).
+fn cff_index(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = (items.len() as u16).to_be_bytes().to_vec();
+    if items.is_empty() {
+        return out;
+    }
+    out.push(4);
+    let mut off = 1u32;
+    out.extend(off.to_be_bytes());
+    for it in items {
+        off += it.len() as u32;
+        out.extend(off.to_be_bytes());
+    }
+    for it in items {
+        out.extend(it);
+    }
+    out
+}
+
+/// A DICT integer operand in its five-byte form (so offsets don't change the length).
+fn cff_int(v: i32) -> Vec<u8> {
+    [vec![29], v.to_be_bytes().to_vec()].concat()
+}
+
+/// A one-glyph CFF font set: glyph 1 is a 500 × 700 box, 600 wide. CID-keyed fonts give it CID 5.
+fn tiny_cff(cid: bool) -> Vec<u8> {
+    let n = |v: i32| vec![(v + 139) as u8];
+    let box_glyph =
+        [n(-100), n(50), n(0), vec![21], vec![247, 136], n(0), vec![5], n(0), vec![248, 80], vec![5], vec![251, 136], n(0), vec![5], vec![14]]
+            .concat();
+    // 600 = width as the first (odd) operand: nominalWidthX 700 → −100.
+    let charstrings = cff_index(&[vec![14], box_glyph]);
+    let charset = if cid { vec![0, 0, 5] } else { vec![0, 0, 34] };
+    let private = [cff_int(700), vec![21]].concat();
+    let strings = cff_index(&[b"Adobe".to_vec(), b"Identity".to_vec()]);
+    let head = vec![1, 0, 4, 4];
+    let names = cff_index(&[b"T".to_vec()]);
+    // Lay out: header, names, top dict, strings, gsubrs, charset, charstrings, private, [fdarray, fdselect].
+    let top_len = |extra: usize| 1 + 2 + 4 + 4 + (5 + 1) * 2 + (5 + 5 + 1) + extra;
+    let extra = if cid { 5 + 5 + 5 + 2 + 5 + 2 + 5 + 2 + 5 + 2 } else { 0 };
+    let top_index_len = 2 + 1 + 8 + (top_len(extra) - 11);
+    let mut at = head.len() + names.len() + top_index_len + strings.len() + 2;
+    let charset_at = at;
+    at += charset.len();
+    let cs_at = at;
+    at += charstrings.len();
+    let priv_at = at;
+    at += private.len();
+    let fd_private = private.clone();
+    let fd_dict = [cff_int(fd_private.len() as i32), cff_int(priv_at as i32), vec![18]].concat();
+    let fdarray = cff_index(&[fd_dict]);
+    let fdarray_at = at;
+    at += fdarray.len();
+    let fdselect_at = at;
+    let fdselect = vec![0, 0, 0];
+    let mut top =
+        [cff_int(charset_at as i32), vec![15], cff_int(cs_at as i32), vec![17], cff_int(private.len() as i32), cff_int(priv_at as i32), vec![18]]
+            .concat();
+    if cid {
+        top = [
+            cff_int(391),
+            cff_int(392),
+            cff_int(0),
+            vec![12, 30],
+            cff_int(6),
+            vec![12, 34],
+            cff_int(fdarray_at as i32),
+            vec![12, 36],
+            cff_int(fdselect_at as i32),
+            vec![12, 37],
+            top,
+        ]
+        .concat();
+    }
+    let tops = cff_index(&[top]);
+    let mut out = [head, names, tops, strings, vec![0, 0]].concat();
+    assert_eq!(out.len(), charset_at, "layout");
+    out.extend(charset);
+    out.extend(charstrings);
+    out.extend(private);
+    if cid {
+        out.extend(fdarray);
+        out.extend(fdselect);
+    }
+    out
+}
+
+fn startdata_eps(cff: &[u8], body: &str) -> Vec<u8> {
+    let mut v =
+        format!("%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 10 20 110 70\n/FontSetInit /ProcSet findresource begin\n/T {} StartData ", cff.len())
+            .into_bytes();
+    v.extend_from_slice(cff);
+    v.extend_from_slice(format!("\n{body}\n%%EOF\n").as_bytes());
+    v
+}
+
+#[test]
+fn cff_fonts_from_startdata_draw_their_glyphs() {
+    let c = content(
+        &eps_to_pdf(&startdata_eps(&tiny_cff(false), "/T findfont 10 scalefont setfont 10 20 moveto (AA) show"), Limits::default()).unwrap().pdf,
+    );
+    assert_eq!(c.lines().filter(|l| *l == "f").count(), 2, "{c}");
+    // The box starts 0.5 points (50 units) in; the second glyph 6 points (600 units) on.
+    assert!(c.contains("10.5 20 m") && c.contains("16.5 20 m"), "{c}");
+}
+
+#[test]
+fn cid_fonts_draw_through_cmaps() {
+    let body = "/T-Identity-H findfont 10 scalefont setfont 10 20 moveto <00050005> show
+                /CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /One-H def
+                1 begincodespacerange <00> <ff> endcodespacerange 1 begincidchar <41> 5 endcidchar
+                endcmap CMapName currentdict /CMap defineresource pop end end
+                /U /One-H [/T] composefont pop /U findfont 10 scalefont setfont 10 40 moveto (AA) show";
+    let c = content(&eps_to_pdf(&startdata_eps(&tiny_cff(true), body), Limits::default()).unwrap().pdf);
+    assert_eq!(c.lines().filter(|l| *l == "f").count(), 4, "{c}");
+    assert!(c.contains("16.5 20 m") && c.contains("16.5 40 m"), "{c}");
+    // Broken font data is a warning, not a failure.
+    let r = eps_to_pdf(&startdata_eps(b"\x01\x00\x04\x04\xff\xff\xff", "0 0 1 1 rectfill"), Limits::default()).unwrap();
+    assert!(r.warnings.iter().any(|w| w.contains("CFF")), "{:?}", r.warnings);
+}
+
+#[test]
+fn tiling_patterns_become_pdf_patterns() {
+    let (c, conv) = run("<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep 10 /YStep 10
+                            /PaintProc { pop 1 0 0 setrgbcolor 0 0 5 5 rectfill } >> matrix makepattern setpattern
+                          10 20 50 30 rectfill
+                          << /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 4 4] /XStep 4 /YStep 4
+                            /PaintProc { pop 1 0 0 setrgbcolor 0 0 2 4 rectfill } >> matrix makepattern /S exch def
+                          [/Pattern /DeviceCMYK] setcolorspace 0 1 0 0 S setcolor 60 20 40 30 rectfill");
+    assert!(c.contains("/Pattern cs") && c.contains("/P0 scn") && c.contains("/P1 scn"), "{c}");
+    let pdf = String::from_utf8_lossy(&conv.pdf);
+    assert!(pdf.contains("/PatternType 1") && pdf.contains("/XStep 10"), "{pdf}");
+    // A cell that fails or nests too deeply ends cleanly.
+    for bad in [
+        "<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 1 1] /XStep 0 /YStep 1 /PaintProc { pop } >> matrix makepattern setpattern 0 0 1 1 rectfill",
+        "/P << /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 1 1] /XStep 1 /YStep 1 /PaintProc { pop P setpattern 0 0 1 1 rectfill } >> matrix makepattern def P setpattern 0 0 1 1 rectfill",
+        "<< /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 1 1] /XStep 1 /YStep 1 /PaintProc { 1 0 div } >> matrix makepattern setpattern 0 0 1 1 rectfill",
+    ] {
+        let _ = eps_to_pdf(&eps(bad), Limits::default());
+    }
+}

@@ -935,15 +935,25 @@ pub fn current_color(ip: &mut Interp) -> R<DevColor> {
 }
 
 fn set_space(ip: &mut Interp, space: Space) {
+    if ip.gs.color_locked {
+        return;
+    }
     ip.gs.color = space.initial();
     ip.gs.space = space;
     ip.gs.pattern = None;
 }
 
+/// Set the colour values (not inside an uncoloured pattern cell).
+fn set_color(ip: &mut Interp, v: Vec<f64>) {
+    if !ip.gs.color_locked {
+        ip.gs.color = v;
+    }
+}
+
 pub fn setgray(ip: &mut Interp) -> R {
     let g = ip.pop_num()?;
     set_space(ip, Space::Gray);
-    ip.gs.color = vec![g];
+    set_color(ip, vec![g]);
     Ok(())
 }
 
@@ -952,7 +962,7 @@ pub fn setrgbcolor(ip: &mut Interp) -> R {
     let g = ip.pop_num()?;
     let r = ip.pop_num()?;
     set_space(ip, Space::Rgb);
-    ip.gs.color = vec![r, g, b];
+    set_color(ip, vec![r, g, b]);
     Ok(())
 }
 
@@ -962,7 +972,7 @@ pub fn setcmykcolor(ip: &mut Interp) -> R {
     let m = ip.pop_num()?;
     let c = ip.pop_num()?;
     set_space(ip, Space::Cmyk);
-    ip.gs.color = vec![c, m, y, k];
+    set_color(ip, vec![c, m, y, k]);
     Ok(())
 }
 
@@ -982,7 +992,7 @@ pub fn sethsbcolor(ip: &mut Interp) -> R {
         _ => (v, p, q),
     };
     set_space(ip, Space::Rgb);
-    ip.gs.color = vec![r, g, b];
+    set_color(ip, vec![r, g, b]);
     Ok(())
 }
 
@@ -1051,7 +1061,17 @@ pub fn currentcmykcolor(ip: &mut Interp) -> R {
 pub fn setcolorspace(ip: &mut Interp) -> R {
     let o = ip.pop()?;
     let space = parse_space(ip, &o, 0)?;
+    let base = match (&space, &o) {
+        (Space::Pattern, Obj::Array(a, _)) => match a.get(1) {
+            Some(b) => Some(Box::new(parse_space(ip, &b, 1)?)),
+            None => None,
+        },
+        _ => None,
+    };
     set_space(ip, space);
+    if !ip.gs.color_locked {
+        ip.gs.pattern_base = base;
+    }
     Ok(())
 }
 
@@ -1070,7 +1090,17 @@ pub fn currentcolorspace(ip: &mut Interp) -> R {
 
 pub fn setcolor(ip: &mut Interp) -> R {
     if let Space::Pattern = ip.gs.space {
-        if let Obj::Dict(d) = ip.pop()? {
+        // An uncoloured pattern comes after its colour: `c1 … cn pattern setcolor`.
+        if let Obj::Dict(d) = ip.pop()?
+            && !ip.gs.color_locked
+        {
+            let uncolored = d.get_name(b"PaintType").and_then(|o| o.num()) == Some(2.0);
+            let mut under = Vec::new();
+            while uncolored && ip.top(0).is_ok_and(|o| o.num().is_some()) && under.len() < 4 {
+                under.push(ip.pop_num()?);
+            }
+            under.reverse();
+            ip.gs.color = under;
             ip.gs.pattern = Some(d);
         }
         return Ok(());
@@ -1080,7 +1110,7 @@ pub fn setcolor(ip: &mut Interp) -> R {
     for slot in v.iter_mut().rev() {
         *slot = ip.pop_num()?;
     }
-    ip.gs.color = v;
+    set_color(ip, v);
     Ok(())
 }
 
@@ -1093,7 +1123,15 @@ pub fn currentcolor(ip: &mut Interp) -> R {
 
 pub fn setpattern(ip: &mut Interp) -> R {
     let d: PDict = ip.pop_dict()?;
+    if ip.gs.color_locked {
+        return Ok(());
+    }
+    // Under an uncoloured pattern, the current colour stays its colour.
+    let under = ip.gs.color.clone();
     set_space(ip, Space::Pattern);
+    if d.get_name(b"PaintType").and_then(|o| o.num()) == Some(2.0) {
+        ip.gs.color = under;
+    }
     ip.gs.pattern = Some(d);
     Ok(())
 }

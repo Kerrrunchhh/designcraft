@@ -534,6 +534,13 @@ pub fn defineresource(ip: &mut Interp) -> R {
     let cat = ip.pop_name()?;
     let v = ip.pop()?;
     let key = ip.pop()?;
+    if cat == b"CIDFont"
+        && let Obj::Dict(d) = &v
+        && !d.known(&Key::Name(name(b"FID")))
+    {
+        d.put_name(b"FID", Obj::FontId(ip.next_fid));
+        ip.next_fid += 1;
+    }
     if cat == b"Font"
         && let Obj::Dict(d) = &v
     {

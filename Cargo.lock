@@ -1111,6 +1111,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "designcraft-postscript"
+version = "0.8.0"
+dependencies = [
+ "miniz_oxide 0.8.9",
+ "pdf-writer",
+ "weezl",
+]
+
+[[package]]
 name = "designcraft-pptx"
 version = "0.8.0"
 dependencies = [

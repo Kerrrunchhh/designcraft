@@ -61,6 +61,42 @@ pub fn bounding_box(ps: &[u8]) -> Option<[f64; 4]> {
     read("%%HiResBoundingBox:").or_else(|| read("%%BoundingBox:"))
 }
 
+/// An EPS file (plain, or DOS EPS with a binary header)?
+pub fn is_eps(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xC5, 0xD0, 0xD3, 0xC6])
+        || (bytes.starts_with(b"%!PS-Adobe") && bytes.get(..bytes.len().min(64)).is_some_and(|h| h.windows(4).any(|w| w == b"EPSF")))
+}
+
+/// How many converted EPS files are kept.
+const CACHE_ENTRIES: usize = 64;
+
+type Cache = std::collections::HashMap<(u64, usize), Option<std::sync::Arc<Vec<u8>>>>;
+
+fn cache() -> &'static std::sync::Mutex<Cache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(Cache::new()))
+}
+
+/// [`eps_to_pdf`] with the default limits, remembered by content: the screen, thumbnails and
+/// every export convert an EPS once. None when it can't be converted (callers show its preview).
+pub fn cached_pdf(eps: &[u8]) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    eps.hash(&mut h);
+    let key = (h.finish(), eps.len());
+    if let Some(hit) = cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
+        return hit.clone();
+    }
+    // Convert outside the lock: other EPS files keep drawing meanwhile.
+    let pdf = eps_to_pdf(eps, Limits::default()).ok().map(|c| std::sync::Arc::new(c.pdf));
+    let mut c = cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if c.len() >= CACHE_ENTRIES {
+        c.clear();
+    }
+    c.insert(key, pdf.clone());
+    pdf
+}
+
 /// Run an EPS and write what it paints as PDF. `Err` when it isn't an EPS with a bounding box,
 /// when the program fails before painting anything, or when it exceeds `limits`.
 pub fn eps_to_pdf(bytes: &[u8], limits: Limits) -> Result<Converted, String> {

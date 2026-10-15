@@ -222,6 +222,8 @@ impl Out {
     /// The PDF: one page of `size`, its content and images.
     pub fn finish(self, size: (f64, f64)) -> Vec<u8> {
         let mut pdf = Pdf::new();
+        // Nothing newer is used (no transparency groups): PDF/X-1a files can take it.
+        pdf.set_version(1, 4);
         let (catalog, pages, page, content) = (Ref::new(1), Ref::new(2), Ref::new(3), Ref::new(4));
         let mut next = 5;
         let mut alloc = || {

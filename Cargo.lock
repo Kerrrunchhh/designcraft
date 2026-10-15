@@ -1117,6 +1117,7 @@ version = "0.8.0"
 dependencies = [
  "miniz_oxide 0.8.9",
  "pdf-writer",
+ "skrifa 0.47.0",
  "weezl",
 ]
 

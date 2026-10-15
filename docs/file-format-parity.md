@@ -57,7 +57,7 @@ score below).
 | JPEG, PNG, GIF, BMP, WebP | | ✓ | ✓ | CMYK JPEG/TIFF keep inks in PDF (#35) | 2% |
 | TIFF | `.tif` | ✓ incl. CMYK, alpha, indexed colour, paths | ✓ incl. CMYK | clipping paths from 8BIM resources unverified | 1% |
 | PSD | `.psd` | ✓ layers, comps, alpha, paths | ~ composite + Object Layer Options | layer comps partial | 1% |
-| EPS | `.eps` | ✓ (PostScript) | ~ own PostScript interpreter: vectors, CMYK and spot colours, images, Type 1/Type 3 text; no CFF/TrueType glyphs or smooth shadings yet (preview then) | | <1% |
+| EPS | `.eps` | ✓ (PostScript) | ~ own PostScript interpreter: vectors, CMYK and spot colours, images, smooth shadings and meshes, Type 1/Type 3/Type 42 text; no CFF glyphs or tiling patterns yet | | <1% |
 | SVG | `.svg` | ✓ | ✓ (usvg) | | <1% |
 | HEIC | `.heic` | ✓ | ✗ | | <1% |
 | Word | `.docx` | ✓ styles, footnotes, tables, track changes, options | ✓ styles by name, footnotes, tables, tabs, breaks, moved text (#257), bullets and numbering from `numbering.xml` (#626; parent levels in a label are fixed text), style mapping and conflicts | `.doc` not supported (InDesign reads it) | 2% |

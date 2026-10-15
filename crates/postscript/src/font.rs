@@ -174,8 +174,22 @@ fn outline(ip: &mut Interp, font: &PDict, code: u8) -> Option<std::rc::Rc<crate:
     if let Some(hit) = ip.glyphs.get(&(fid, g.clone())) {
         return Some(hit.clone());
     }
-    let std = crate::encodings::standard();
-    let glyph = std::rc::Rc::new(crate::type1::glyph(font, &g, &std)?);
+    let glyph = if font.get_name(b"FontType").and_then(|o| o.num()) == Some(42.0) {
+        let data = match ip.sfnts.get(&fid) {
+            Some(d) => d.clone(),
+            None => {
+                let d = std::rc::Rc::new(crate::type42::sfnts(font)?);
+                if ip.sfnts.len() < 256 {
+                    ip.sfnts.insert(fid, d.clone());
+                }
+                d
+            }
+        };
+        std::rc::Rc::new(crate::type42::glyph(&data, crate::type42::glyph_index(font, &g))?)
+    } else {
+        let std = crate::encodings::standard();
+        std::rc::Rc::new(crate::type1::glyph(font, &g, &std)?)
+    };
     if ip.glyphs.len() < 100_000 {
         ip.glyphs.insert((fid, g), glyph.clone());
     }

@@ -135,3 +135,65 @@ fn hostile_programs_end_with_an_error_not_a_hang_or_panic() {
     assert!(eps_to_pdf(b"%!PS-Adobe-3.0 EPSF-3.0\n0 0 1 1 rectfill\n", limits).is_err(), "no bounding box");
     assert!(eps_to_pdf(b"not postscript", limits).is_err());
 }
+
+#[test]
+fn a_file_in_a_name_is_data_until_executed() {
+    // cairo keeps its image filter in a name and calls `status` and `flushfile` on it.
+    let (c, _) = run("/f (0.5 setgray 10 20 5 5 rectfill) 0 () /SubFileDecode filter def f status pop f cvx exec");
+    assert!(c.contains("0.5 g"), "{c}");
+}
+
+#[test]
+fn smooth_shadings_become_pdf_shadings() {
+    let (c, conv) = run("<< /ShadingType 2 /ColorSpace /DeviceCMYK /Coords [10 20 110 20] /Extend [true true]
+                           /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0 0] /C1 [0 0 1 0] /N 1 >> >> shfill
+                         << /ShadingType 3 /ColorSpace [/Separation (Gold) /DeviceCMYK { dup 0.2 mul exch 0 exch 0 } ]
+                           /Coords [60 45 0 60 45 20] /Function { } >> shfill");
+    assert_eq!(c.matches(" sh").count(), 2, "{c}");
+    let pdf = String::from_utf8_lossy(&conv.pdf);
+    assert!(pdf.contains("/ShadingType 2") && pdf.contains("/ShadingType 3"), "{pdf}");
+    // CMYK and a spot made of CMYK stay CMYK.
+    assert_eq!(pdf.matches("/ColorSpace /DeviceCMYK").count(), 2, "{pdf}");
+}
+
+#[test]
+fn shading_patterns_fill_their_path() {
+    let (c, _) = run("<< /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0]
+                         /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> matrix makepattern
+                       setpattern 10 20 50 30 rectfill");
+    assert!(c.contains("W") && c.contains(" sh"), "clipped to the rectangle, then shaded: {c}");
+}
+
+#[test]
+fn mesh_shadings_keep_their_vertices() {
+    // Two free-form triangles from an array, the second sharing an edge (flag 1).
+    let (_, conv) = run("<< /ShadingType 4 /ColorSpace /DeviceRGB
+                           /DataSource [0 10 20 1 0 0  0 110 20 0 1 0  0 60 70 0 0 1  1 110 70 1 1 0] >> shfill
+                         << /ShadingType 6 /ColorSpace /DeviceGray /DataSource [0 10 20 10 30 10 40 10 50 20 50 30 50 40 50 50 50 50 40 50 30 50 20 40 20 30 20 20 20  0 0.3 0.6 1] >> shfill");
+    let pdf = String::from_utf8_lossy(&conv.pdf);
+    assert!(pdf.contains("/ShadingType 4") && pdf.contains("/ShadingType 6"), "{pdf}");
+    // Malformed meshes draw what they hold, or nothing.
+    for bad in [
+        "<< /ShadingType 4 /ColorSpace /DeviceRGB /DataSource [0 1] >> shfill",
+        "<< /ShadingType 7 /ColorSpace /DeviceGray /DataSource (abc) /BitsPerCoordinate 32 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 1 0 1 0 1] >> shfill 0 0 1 1 rectfill",
+    ] {
+        let _ = eps_to_pdf(&eps(bad), Limits::default());
+    }
+}
+
+#[test]
+fn type42_fonts_draw_their_truetype_glyphs() {
+    use skrifa::MetadataProvider;
+    let ttf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/JetBrainsMono-Regular.ttf")).unwrap();
+    let gid = skrifa::FontRef::new(&ttf).unwrap().charmap().map('A').unwrap().to_u32();
+    // sfnts strings split at an even length below the string limit.
+    let sfnts: String = ttf.chunks(30_000).map(|c| format!("<{}>\n", c.iter().map(|b| format!("{b:02x}")).collect::<String>())).collect();
+    let (c, _) = run(&format!(
+        "/T42 11 dict dup begin /FontType 42 def /FontMatrix [1 0 0 1 0 0] def /PaintType 0 def /FontBBox [0 0 1 1] def
+         /Encoding 256 array def 0 1 255 {{ Encoding exch /.notdef put }} for Encoding 65 /A put
+         /CharStrings 2 dict dup /.notdef 0 put dup /A {gid} put def /sfnts [ {sfnts} ] def end definefont
+         20 scalefont setfont 10 20 moveto (AA) show"
+    ));
+    // Two outlined glyphs, filled; the second 12 points on (JetBrains Mono advances 600/1000).
+    assert_eq!(c.lines().filter(|l| *l == "f").count(), 2, "{}", &c[..c.len().min(400)]);
+}

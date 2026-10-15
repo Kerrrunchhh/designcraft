@@ -177,8 +177,7 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 
 ### 19. Placed graphics depth (FF)
 - **Missing:** EPS runs through DesignCraft's own PostScript interpreter (shown and exported as
-  vectors); still missing there: CFF and TrueType (Type 42) glyphs, smooth shadings and patterns
-  (`shfill`, pattern fills), `strokepath`. PSD layer comps beyond visibility; Edit Original / Edit With; PDF placed as editable vectors (#227, #24);
+  vectors); still missing there: CFF glyphs (FontType 2, CIDFonts), tiling patterns, `strokepath`. PSD layer comps beyond visibility; Edit Original / Edit With; PDF placed as editable vectors (#227, #24);
   QuarkXPress import (#73).
 - **Estimate:** 30–60 h, plus 20–40 h for the rest of the PostScript imaging model.
 

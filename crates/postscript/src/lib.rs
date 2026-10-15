@@ -4,9 +4,10 @@
 //!
 //! Written from the PostScript Language Reference (third edition) and the EPS specification.
 //! Covered: the language (Level 3 operators EPS files use), paths, painting, clipping, device and
-//! Separation/DeviceN/Indexed colour, sampled images with the standard filters, Type 3 fonts.
-//! Not yet: Type 1/CFF/TrueType glyphs (text in those fonts advances without drawing), smooth
-//! shadings and patterns.
+//! Separation/DeviceN/Indexed colour, sampled images with the standard filters, smooth shadings
+//! (axial, radial, function-based, triangle and patch meshes) and shading patterns, Type 1,
+//! Type 3 and Type 42 fonts. Not yet: CFF glyphs (text in them advances without drawing) and
+//! tiling patterns (a grey stands in).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -20,6 +21,7 @@ mod pdf;
 mod scan;
 mod source;
 mod type1;
+mod type42;
 
 pub use interp::Limits;
 

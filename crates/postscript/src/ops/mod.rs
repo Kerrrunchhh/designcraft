@@ -3,7 +3,9 @@
 pub mod basic;
 pub mod gfx;
 pub mod image;
+pub mod mesh;
 pub mod misc;
+pub mod shading;
 
 use crate::font;
 use crate::interp::{Interp, R};
@@ -76,7 +78,7 @@ pub static OPS: &[(&[u8], OpFn)] = named! {
     "clipsave" => gfx::clipsave, "cliprestore" => gfx::cliprestore, "clip" => gfx::clip, "eoclip" => gfx::eoclip, "rectclip" => gfx::rectclip,
     // painting
     "fill" => gfx::fill, "eofill" => gfx::eofill, "stroke" => gfx::stroke, "rectfill" => gfx::rectfill,
-    "rectstroke" => gfx::rectstroke, "shfill" => gfx::shfill, "erasepage" => misc::noop,
+    "rectstroke" => gfx::rectstroke, "shfill" => shading::shfill, "erasepage" => misc::noop,
     "image" => image::image, "colorimage" => image::colorimage, "imagemask" => image::imagemask,
     // colour
     "setgray" => gfx::setgray, "currentgray" => gfx::currentgray, "setrgbcolor" => gfx::setrgbcolor,

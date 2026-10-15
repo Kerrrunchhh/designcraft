@@ -40,6 +40,52 @@ pub struct Image {
     pub smask: Option<(u32, u32, Vec<u8>)>,
 }
 
+/// The device space a shading's colours were sampled in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+}
+
+impl OutSpace {
+    fn comps(self) -> usize {
+        match self {
+            OutSpace::Gray => 1,
+            OutSpace::Rgb => 3,
+            OutSpace::Cmyk => 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShadeKind {
+    Axial([f64; 4]),
+    Radial([f64; 6]),
+    /// A function of (x, y) over its domain, mapped by `matrix`.
+    Function {
+        domain: [f64; 4],
+        matrix: M,
+    },
+    /// Vertices in threes; `Coons` and `Tensor` patches of 12 and 16 points.
+    Triangles,
+    Coons,
+    Tensor,
+}
+
+/// A smooth shading with its colours sampled: along the axis (`samples` of them), over a
+/// `samples` × `samples` grid, or one per vertex or patch corner.
+#[derive(Clone, Debug)]
+pub struct Shading {
+    pub kind: ShadeKind,
+    pub extend: [bool; 2],
+    pub space: OutSpace,
+    pub data: Vec<u8>,
+    pub samples: usize,
+    pub bbox: Option<[f64; 4]>,
+    pub points: Vec<(f64, f64)>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PaintState {
     fill: Option<DevColor>,
@@ -57,6 +103,7 @@ pub struct StrokeParams<'a> {
 pub struct Out {
     c: Content,
     images: Vec<Image>,
+    shadings: Vec<Shading>,
     applied: Vec<Rc<Clip>>,
     state: PaintState,
     saved: Vec<PaintState>,
@@ -73,7 +120,16 @@ impl Out {
     pub fn new(origin: (f64, f64)) -> Self {
         let mut c = Content::new();
         c.transform([1.0, 0.0, 0.0, 1.0, f(-origin.0), f(-origin.1)]);
-        Out { c, images: Vec::new(), applied: Vec::new(), state: PaintState::default(), saved: Vec::new(), segments: 0, painted: false }
+        Out {
+            c,
+            images: Vec::new(),
+            shadings: Vec::new(),
+            applied: Vec::new(),
+            state: PaintState::default(),
+            saved: Vec::new(),
+            segments: 0,
+            painted: false,
+        }
     }
 
     fn sync_clip(&mut self, clip: &Option<Rc<Clip>>) -> Result<(), String> {
@@ -219,7 +275,40 @@ impl Out {
         Ok(())
     }
 
-    /// The PDF: one page of `size`, its content and images.
+    /// Paint a shading in shading space `m` (inside `path` too, for a shading pattern fill).
+    pub fn shade(&mut self, clip: &Option<Rc<Clip>>, path: Option<&[Seg]>, eo: bool, m: &M, s: Shading) -> Result<(), String> {
+        if self.shadings.len() >= MAX_IMAGES {
+            return Err("too many shadings".into());
+        }
+        if !m.finite() || m.inv().is_none() {
+            return Ok(());
+        }
+        self.sync_clip(clip)?;
+        self.c.save_state();
+        if let Some(p) = path {
+            self.path(p)?;
+            if eo {
+                self.c.clip_even_odd();
+            } else {
+                self.c.clip_nonzero();
+            }
+            self.c.end_path();
+        }
+        self.c.transform(m.0.map(f));
+        if let Some([x0, y0, x1, y1]) = s.bbox {
+            self.c.rect(f(x0), f(y0), f(x1 - x0), f(y1 - y0));
+            self.c.clip_nonzero();
+            self.c.end_path();
+        }
+        let name = format!("Sh{}", self.shadings.len());
+        self.shadings.push(s);
+        self.c.shading(Name(name.as_bytes()));
+        self.c.restore_state();
+        self.painted = true;
+        Ok(())
+    }
+
+    /// The PDF: one page of `size`, its content, images and shadings.
     pub fn finish(self, size: (f64, f64)) -> Vec<u8> {
         let mut pdf = Pdf::new();
         // Nothing newer is used (no transparency groups): PDF/X-1a files can take it.
@@ -232,6 +321,7 @@ impl Out {
             r
         };
         let image_refs: Vec<(Ref, Option<Ref>)> = self.images.iter().map(|i| (alloc(), i.smask.as_ref().map(|_| alloc()))).collect();
+        let shading_refs: Vec<(Ref, Ref)> = self.shadings.iter().map(|_| (alloc(), alloc())).collect();
         pdf.catalog(catalog).pages(pages);
         pdf.pages(pages).kids([page]).count(1);
         {
@@ -246,6 +336,12 @@ impl Out {
                 xo.pair(Name(name.as_bytes()), *r);
             }
             xo.finish();
+            let mut sh = res.shadings();
+            for (i, (r, _)) in shading_refs.iter().enumerate() {
+                let name = format!("Sh{i}");
+                sh.pair(Name(name.as_bytes()), *r);
+            }
+            sh.finish();
             res.finish();
             p.finish();
         }
@@ -313,6 +409,111 @@ impl Out {
                 s.finish();
             }
         }
+        for (s, (r, fr)) in self.shadings.iter().zip(&shading_refs) {
+            write_shading(&mut pdf, s, *r, *fr);
+        }
         pdf.finish()
+    }
+}
+
+fn set_space(cs: pdf_writer::writers::ColorSpace<'_>, s: OutSpace) {
+    match s {
+        OutSpace::Gray => cs.device_gray(),
+        OutSpace::Rgb => cs.device_rgb(),
+        OutSpace::Cmyk => cs.device_cmyk(),
+    }
+}
+
+fn write_shading(pdf: &mut Pdf, s: &Shading, r: Ref, fr: Ref) {
+    use pdf_writer::types::FunctionShadingType;
+    use pdf_writer::writers::StreamShadingType;
+    let n = s.space.comps();
+    let range: Vec<f32> = (0..n).flat_map(|_| [0.0, 1.0]).collect();
+    let samples = i32::try_from(s.samples.max(2)).unwrap_or(2);
+    match &s.kind {
+        ShadeKind::Axial(_) | ShadeKind::Radial(_) | ShadeKind::Function { .. } => {
+            {
+                let mut func = pdf.sampled_function(fr, &s.data);
+                if let ShadeKind::Function { domain, .. } = &s.kind {
+                    func.domain(domain.map(f));
+                    func.size([samples, samples]);
+                } else {
+                    func.domain([0.0, 1.0]);
+                    func.size([samples]);
+                }
+                func.range(range.iter().copied());
+                func.bits_per_sample(8);
+            }
+            let mut sh = pdf.function_shading(r);
+            match &s.kind {
+                ShadeKind::Axial(c) => {
+                    sh.shading_type(FunctionShadingType::Axial);
+                    sh.coords(c.map(f));
+                    sh.extend(s.extend);
+                }
+                ShadeKind::Radial(c) => {
+                    sh.shading_type(FunctionShadingType::Radial);
+                    sh.coords(c.map(f));
+                    sh.extend(s.extend);
+                }
+                ShadeKind::Function { domain, matrix } => {
+                    sh.shading_type(FunctionShadingType::Function);
+                    sh.domain(domain.map(f));
+                    sh.matrix(matrix.0.map(f));
+                }
+                _ => {}
+            }
+            set_space(sh.color_space(), s.space);
+            sh.function(fr);
+        }
+        ShadeKind::Triangles | ShadeKind::Coons | ShadeKind::Tensor => {
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for (x, y) in &s.points {
+                x0 = x0.min(*x);
+                y0 = y0.min(*y);
+                x1 = x1.max(*x);
+                y1 = y1.max(*y);
+            }
+            if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+                return;
+            }
+            let (x1, y1) = (x1.max(x0 + 1e-3), y1.max(y0 + 1e-3));
+            let q = |v: f64, lo: f64, hi: f64| (((v - lo) / (hi - lo)).clamp(0.0, 1.0) * f64::from(u32::MAX)).round() as u32;
+            let mut data = Vec::new();
+            let (per, cols) = match s.kind {
+                ShadeKind::Triangles => (1, 1),
+                ShadeKind::Coons => (12, 4),
+                _ => (16, 4),
+            };
+            let colors: Vec<&[u8]> = s.data.chunks(n).collect();
+            for (i, chunk) in s.points.chunks(per).enumerate() {
+                if chunk.len() != per {
+                    break;
+                }
+                data.push(0u8);
+                for (x, y) in chunk {
+                    data.extend(q(*x, x0, x1).to_be_bytes());
+                    data.extend(q(*y, y0, y1).to_be_bytes());
+                }
+                for k in 0..cols {
+                    data.extend_from_slice(colors.get(i * cols + k).copied().unwrap_or(&[]));
+                }
+            }
+            let z = miniz_oxide::deflate::compress_to_vec_zlib(&data, 6);
+            let mut sh = pdf.stream_shading(r, &z);
+            sh.filter(Filter::FlateDecode);
+            sh.shading_type(match s.kind {
+                ShadeKind::Triangles => StreamShadingType::FreeformGouraud,
+                ShadeKind::Coons => StreamShadingType::CoonsPatch,
+                _ => StreamShadingType::TensorProductPatch,
+            });
+            set_space(sh.color_space(), s.space);
+            sh.bits_per_coordinate(32);
+            sh.bits_per_component(8);
+            sh.bits_per_flag(8);
+            let mut decode = vec![f(x0), f(x1), f(y0), f(y1)];
+            decode.extend(range);
+            sh.decode(decode);
+        }
     }
 }

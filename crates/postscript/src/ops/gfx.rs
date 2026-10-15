@@ -653,6 +653,9 @@ pub fn fill_path(ip: &mut Interp, path: &[Seg], eo: bool) -> R {
     if ip.gs.nulldev {
         return Ok(());
     }
+    if matches!(ip.gs.space, Space::Pattern) && crate::ops::shading::fill_pattern(ip, path, eo)? {
+        return Ok(());
+    }
     let color = current_color(ip)?;
     ip.out.fill(&ip.gs.clip, path, eo, color).map_err(PsErr::Fatal)
 }
@@ -769,13 +772,6 @@ pub fn clippath(ip: &mut Interp) -> R {
         _ => None,
     });
     ip.gs.path = path;
-    Ok(())
-}
-
-pub fn shfill(ip: &mut Interp) -> R {
-    // Smooth shadings: painted as their background (or not at all) until shadings are drawn.
-    let _ = ip.pop_dict()?;
-    ip.warnings.push("shfill: smooth shading not drawn".into());
     Ok(())
 }
 
@@ -1102,8 +1098,14 @@ pub fn setpattern(ip: &mut Interp) -> R {
     Ok(())
 }
 
+/// A pattern instance: a copy of the prototype with its pattern space (matrix · CTM).
 pub fn makepattern(ip: &mut Interp) -> R {
-    let _m = ip.pop_matrix()?;
+    let m = ip.pop_matrix()?;
     let d = ip.pop_dict()?;
-    ip.push(Obj::Dict(d))
+    let inst = PDict::new(d.len() + 2);
+    for (k, v) in d.entries() {
+        inst.put(k, v);
+    }
+    inst.put_name(b"DesignCraftMatrix", matrix_obj(&m.then(&ip.gs.ctm)));
+    ip.push(Obj::Dict(inst))
 }

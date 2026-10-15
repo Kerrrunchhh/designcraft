@@ -130,6 +130,8 @@ pub struct Interp {
     pub next_fid: usize,
     pub main: usize,
     pub warnings: Vec<String>,
+    /// Type 42 fonts' TrueType data by FID.
+    pub sfnts: std::collections::HashMap<usize, std::rc::Rc<Vec<u8>>>,
     /// `charpath` is running: glyphs add to the path instead of painting.
     pub charpath: bool,
     /// Glyph outlines by font (FID) and glyph name.
@@ -173,6 +175,7 @@ impl Interp {
             recent: std::collections::VecDeque::new(),
             glyphs: std::collections::HashMap::new(),
             charpath: false,
+            sfnts: std::collections::HashMap::new(),
         };
         ops::install(&mut ip);
         ip
@@ -340,7 +343,8 @@ impl Interp {
             }
             Obj::Op(op) => self.call_op(op),
             // A name bound to another executable name: one more level (bounded by the loop).
-            o @ (Obj::Name(_, true) | Obj::Str(_, true) | Obj::File(_)) => self.exec_value(o),
+            // Files are literal unless `exec` runs them (`cvx exec`).
+            o @ (Obj::Name(_, true) | Obj::Str(_, true)) => self.exec_value(o),
             other => self.push(other),
         }
     }

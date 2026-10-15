@@ -255,7 +255,7 @@ impl Obj {
     pub fn is_exec(&self) -> bool {
         match self {
             Obj::Name(_, x) | Obj::Str(_, x) | Obj::Array(_, x) => *x,
-            Obj::Op(_) | Obj::File(_) => true,
+            Obj::Op(_) => true,
             _ => false,
         }
     }

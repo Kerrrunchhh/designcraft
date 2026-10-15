@@ -13,3 +13,4 @@ pdf-writer = { workspace = true }
 miniz_oxide = { workspace = true }
 weezl = { workspace = true }
 skrifa = { workspace = true }
+kurbo = { workspace = true }

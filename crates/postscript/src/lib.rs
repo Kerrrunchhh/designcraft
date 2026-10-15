@@ -7,7 +7,7 @@
 //! Separation/DeviceN/Indexed colour, sampled images with the standard filters, smooth shadings
 //! (axial, radial, function-based, triangle and patch meshes), shading and tiling patterns, and
 //! text in Type 1, Type 3, Type 42 and CFF fonts (`StartData`), CIDFonts and composite fonts
-//! through CMaps. Not yet: `strokepath`, vertical writing.
+//! through CMaps, written horizontally or vertically.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 

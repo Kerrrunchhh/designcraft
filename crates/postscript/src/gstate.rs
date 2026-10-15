@@ -255,6 +255,36 @@ pub fn bbox(path: &[Seg]) -> Option<[f64; 4]> {
     b
 }
 
+/// The most dashes a stroke may break into; beyond, it is drawn solid (a tiny pattern on a
+/// long path would otherwise make billions of pieces).
+pub const MAX_DASHES: f64 = 100_000.0;
+
+/// Whether dash pattern `dash` on `path` (in the space the pattern is measured in) stays within
+/// [`MAX_DASHES`]; its lengths must be finite and not all zero.
+pub fn dashes_ok(path: &[Seg], dash: &[f64]) -> bool {
+    let period: f64 = dash.iter().sum();
+    if dash.is_empty() || !period.is_finite() || period <= 0.0 || dash.iter().any(|d| !d.is_finite() || *d < 0.0) {
+        return false;
+    }
+    let mut len = 0.0;
+    let mut cur = (0.0, 0.0);
+    for s in path {
+        match *s {
+            Seg::Move(x, y) => cur = (x, y),
+            Seg::Line(x, y) => {
+                len += (x - cur.0).hypot(y - cur.1);
+                cur = (x, y);
+            }
+            Seg::Curve(a, b, c, d, e, f) => {
+                len += (a - cur.0).hypot(b - cur.1) + (c - a).hypot(d - b) + (e - c).hypot(f - d);
+                cur = (e, f);
+            }
+            Seg::Close => {}
+        }
+    }
+    len.is_finite() && len / period * dash.len() as f64 <= MAX_DASHES
+}
+
 /// A path with its curves replaced by line segments (`flattenpath`).
 pub fn flatten(path: &[Seg], tol: f64) -> Vec<Seg> {
     let mut out = Vec::with_capacity(path.len());

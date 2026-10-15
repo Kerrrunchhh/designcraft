@@ -14,6 +14,8 @@ pub struct CMap {
     ranges: Vec<(Vec<u8>, Vec<u8>, u32)>,
     parent: Option<usize>,
     identity: bool,
+    /// Vertical writing (WMode 1).
+    pub vertical: bool,
 }
 
 const MAX_CMAPS: usize = 10_000;
@@ -83,7 +85,12 @@ pub fn begincmap(_ip: &mut Interp) -> R {
 }
 
 pub fn endcmap(ip: &mut Interp) -> R {
-    ip.building().map(|_| ())
+    let i = ip.building()?;
+    let vertical = ip.current_dict()?.get_name(b"WMode").and_then(|o| o.num()) == Some(1.0);
+    if let Some(m) = ip.cmaps.get_mut(i) {
+        m.vertical = vertical;
+    }
+    Ok(())
 }
 
 pub fn usecmap(ip: &mut Interp) -> R {
@@ -166,7 +173,8 @@ pub fn end_ignored(ip: &mut Interp) -> R {
 fn identity(ip: &mut Interp, n: &[u8]) -> PDict {
     let d = PDict::new(4);
     d.put_name(b"CMapName", Obj::lit(n));
-    ip.cmaps.push(CMap { codespace: vec![(vec![0, 0], vec![0xff, 0xff])], identity: true, ..Default::default() });
+    let vertical = n.ends_with(b"-V");
+    ip.cmaps.push(CMap { codespace: vec![(vec![0, 0], vec![0xff, 0xff])], identity: true, vertical, ..Default::default() });
     d.put_name(b"DesignCraftCMap", Obj::Int(ip.cmaps.len() as i64 - 1));
     d.put_name(b"WMode", Obj::Int(i64::from(n.ends_with(b"-V"))));
     d
@@ -349,6 +357,8 @@ fn compose(ip: &mut Interp, n: &Obj, cmap: &Obj, descendants: Vec<Obj>) -> R<PDi
     let cm = PDict::new(2);
     cm.put_name(b"DesignCraftCMap", Obj::Int(i as i64));
     d.put_name(b"CMap", Obj::Dict(cm));
+    let vertical = ip.cmaps.get(i).is_some_and(|m| m.vertical);
+    d.put_name(b"WMode", Obj::Int(i64::from(vertical)));
     add_fid(ip, &d);
     ip.fontdir.put(n.clone(), Obj::Dict(d.clone()));
     Ok(d)
@@ -365,6 +375,32 @@ pub fn compose_by_name(ip: &mut Interp, n: &[u8]) -> Option<PDict> {
         }
     }
     None
+}
+
+/// Whether a font writes vertically (its WMode, or its CMap's).
+pub fn vertical(ip: &Interp, font: &PDict) -> bool {
+    match font.get_name(b"WMode").and_then(|o| o.num()) {
+        Some(w) => w == 1.0,
+        None => match font.get_name(b"CMap") {
+            Some(Obj::Dict(d)) => ip.cmap_of(&d).and_then(|i| ip.cmaps.get(i)).is_some_and(|m| m.vertical),
+            _ => false,
+        },
+    }
+}
+
+/// A CIDFont's vertical metrics for a CID in glyph space: the advance (w1) and the position
+/// vector (v) from the horizontal origin to the vertical one. `Metrics2` gives them per CID;
+/// otherwise the defaults: one em down, and v = (half the width, 0.88 em).
+pub fn vertical_metrics(cidfont: &PDict, cid: u32, w0: f64, em: f64) -> ((f64, f64), (f64, f64)) {
+    if let Some(Obj::Dict(m)) = cidfont.get_name(b"Metrics2")
+        && let Some(Obj::Array(a, _)) = m.get(&Key::Int(i64::from(cid)))
+    {
+        let v: Vec<f64> = a.items().iter().filter_map(Obj::num).collect();
+        if let [w1x, w1y, vx, vy] = v[..] {
+            return ((w1x, w1y), (vx, vy));
+        }
+    }
+    ((0.0, -em), (w0 / 2.0, 0.88 * em))
 }
 
 /// What one glyph of a shown string draws with.

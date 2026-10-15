@@ -262,7 +262,7 @@ impl Out {
             _ => LineJoinStyle::MiterJoin,
         });
         self.c.set_miter_limit(f(p.miter.max(1.0)));
-        if !p.dash.0.is_empty() && p.dash.0.iter().any(|d| *d > 0.0) && p.dash.0.iter().all(|d| *d >= 0.0 && d.is_finite()) {
+        if crate::gstate::dashes_ok(&user, &p.dash.0) {
             self.c.set_dash_pattern(p.dash.0.iter().map(|d| f(*d)), f(p.dash.1));
         }
         self.path(&user)?;

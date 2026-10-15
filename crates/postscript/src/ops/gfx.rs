@@ -575,8 +575,88 @@ pub fn reversepath(ip: &mut Interp) -> R {
     Ok(())
 }
 
-pub fn strokepath(_ip: &mut Interp) -> R {
-    // Outlining the stroke isn't done: the path stays (only clipping to strokes is affected).
+/// `strokepath`: the outline of what `stroke` would paint, as the current path. The pen is
+/// shaped in user space (width, caps, joins, miter limit, dashes), as for `stroke`.
+pub fn strokepath(ip: &mut Interp) -> R {
+    use kurbo::{Cap, Join, PathEl, Point, Stroke, StrokeOpts};
+    let ctm = ip.gs.ctm;
+    let Some(inv) = ctm.inv() else {
+        ip.gs.path.clear();
+        return Ok(());
+    };
+    let p = |x: f64, y: f64| {
+        let (x, y) = inv.apply(x, y);
+        Point::new(x, y)
+    };
+    let mut els = Vec::with_capacity(ip.gs.path.len());
+    for s in &ip.gs.path {
+        els.push(match *s {
+            Seg::Move(x, y) => PathEl::MoveTo(p(x, y)),
+            Seg::Line(x, y) => PathEl::LineTo(p(x, y)),
+            Seg::Curve(a, b, c, d, e, f) => PathEl::CurveTo(p(a, b), p(c, d), p(e, f)),
+            Seg::Close => PathEl::ClosePath,
+        });
+    }
+    let g = &ip.gs;
+    let cap = match g.cap {
+        1 => Cap::Round,
+        2 => Cap::Square,
+        _ => Cap::Butt,
+    };
+    let join = match g.join {
+        1 => Join::Round,
+        2 => Join::Bevel,
+        _ => Join::Miter,
+    };
+    let mut style = Stroke::new(g.line_width.max(1e-3)).with_caps(cap).with_join(join).with_miter_limit(g.miter.max(1.0));
+    let user: Vec<Seg> = g.path.iter().map(|s| s.map(&inv)).collect();
+    if !user.iter().all(|s| match *s {
+        Seg::Move(x, y) | Seg::Line(x, y) => x.is_finite() && y.is_finite(),
+        Seg::Curve(a, b, c, d, e, f) => [a, b, c, d, e, f].iter().all(|v| v.is_finite()),
+        Seg::Close => true,
+    }) {
+        ip.gs.path.clear();
+        return Ok(());
+    }
+    if crate::gstate::dashes_ok(&user, &g.dash.0) && g.dash.1.is_finite() {
+        style = style.with_dashes(g.dash.1, g.dash.0.clone());
+    }
+    // Tolerance in user space, about a twentieth of a device unit.
+    let scale = (ctm.0[0] * ctm.0[3] - ctm.0[1] * ctm.0[2]).abs().sqrt().max(1e-9);
+    let out = kurbo::stroke(els, &style, &StrokeOpts::default(), (0.05 / scale).max(1e-6));
+    let mut path = Vec::with_capacity(out.elements().len());
+    let mut cur = (0.0, 0.0);
+    for el in out.elements() {
+        if path.len() >= MAX_PATH {
+            return err("limitcheck");
+        }
+        let d = |q: Point| ctm.apply(q.x, q.y);
+        match *el {
+            PathEl::MoveTo(q) => {
+                cur = d(q);
+                path.push(Seg::Move(cur.0, cur.1));
+            }
+            PathEl::LineTo(q) => {
+                cur = d(q);
+                path.push(Seg::Line(cur.0, cur.1));
+            }
+            PathEl::QuadTo(c, q) => {
+                let (c, e) = (d(c), d(q));
+                let a = (cur.0 + 2.0 / 3.0 * (c.0 - cur.0), cur.1 + 2.0 / 3.0 * (c.1 - cur.1));
+                let b = (e.0 + 2.0 / 3.0 * (c.0 - e.0), e.1 + 2.0 / 3.0 * (c.1 - e.1));
+                path.push(Seg::Curve(a.0, a.1, b.0, b.1, e.0, e.1));
+                cur = e;
+            }
+            PathEl::CurveTo(a, b, q) => {
+                let (a, b, e) = (d(a), d(b), d(q));
+                path.push(Seg::Curve(a.0, a.1, b.0, b.1, e.0, e.1));
+                cur = e;
+            }
+            PathEl::ClosePath => path.push(Seg::Close),
+        }
+    }
+    ip.gs.path = path;
+    ip.gs.cur = Some(cur);
     Ok(())
 }
 

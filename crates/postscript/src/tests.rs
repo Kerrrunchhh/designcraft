@@ -339,3 +339,45 @@ fn tiling_patterns_become_pdf_patterns() {
         let _ = eps_to_pdf(&eps(bad), Limits::default());
     }
 }
+
+#[test]
+fn strokepath_outlines_the_stroke() {
+    // A 4-point butt-capped line from (10,20) to (60,20): its outline is the band y 18–22.
+    let (c, _) = run("newpath 10 30 moveto 60 30 lineto 4 setlinewidth strokepath 0 setgray fill");
+    assert!(c.lines().any(|l| l == "f"), "{c}");
+    assert!(!c.contains(" S\n") && !c.lines().any(|l| l == "S"), "filled, not stroked: {c}");
+    for y in ["28", "32"] {
+        assert!(c.contains(&format!(" {y} l")) || c.contains(&format!(" {y} m")), "edge at y={y}: {c}");
+    }
+    // Dashes split it; a path through a degenerate matrix ends empty; a clip to a stroke works.
+    let (c, _) = run("newpath 10 30 moveto 110 30 lineto 2 setlinewidth [10 10] 0 setdash strokepath fill");
+    assert!(c.matches(" m").count() >= 5, "five dashes: {c}");
+    let _ = run("[0 0 0 0 0 0] concat newpath 0 0 moveto 1 1 lineto strokepath fill");
+    let (c, _) = run("newpath 10 30 moveto 100 30 lineto 10 setlinewidth strokepath clip newpath 10 20 100 50 rectfill");
+    assert!(c.contains("W"), "{c}");
+}
+
+#[test]
+fn vertical_cid_text_runs_down_from_its_vertical_origin() {
+    let body = "/T-Identity-V findfont 10 scalefont setfont 10 40 moveto <00050005> show";
+    let c = content(&eps_to_pdf(&startdata_eps(&tiny_cff(true), body), Limits::default()).unwrap().pdf);
+    // v = (300, 880) units: the glyph's origin is 3 left and 8.8 below the point; the second
+    // glyph is one em (10) lower. The box starts 0.5 in from its origin.
+    assert!(c.contains("7.5 31.2 m") && c.contains("7.5 21.2 m"), "{c}");
+    // A CMap program can make a font vertical too.
+    let body = "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /V1 def /WMode 1 def
+                1 begincodespacerange <00> <ff> endcodespacerange 1 begincidchar <41> 5 endcidchar
+                endcmap CMapName currentdict /CMap defineresource pop end end
+                /U /V1 [/T] composefont pop /U findfont 10 scalefont setfont 10 40 moveto (AA) show";
+    let c = content(&eps_to_pdf(&startdata_eps(&tiny_cff(true), body), Limits::default()).unwrap().pdf);
+    assert!(c.contains("7.5 31.2 m") && c.contains("7.5 21.2 m"), "{c}");
+}
+
+#[test]
+fn a_tiny_dash_on_a_long_path_draws_solid() {
+    let body = "newpath 0 30 moveto 100000 30 lineto [0.0001] 0 setdash";
+    let (c, _) = run(&format!("{body} stroke"));
+    assert!(!c.contains(" d\n") && !c.contains("] 0 d"), "{c}");
+    let (c, _) = run(&format!("{body} strokepath fill"));
+    assert!(c.matches(" m").count() < 10, "{}", &c[..c.len().min(300)]);
+}

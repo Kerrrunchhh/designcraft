@@ -222,11 +222,12 @@ fn cid_outline(ip: &mut Interp, font: &PDict, cid: u32) -> Option<std::rc::Rc<cr
     Some(g)
 }
 
-/// Where a glyph at the current point lands: glyph space (through `fm`) → device space.
-fn glyph_to_device(ip: &Interp, fm: &M) -> R<M> {
+/// Where a glyph at the current point lands: glyph space (through `fm`) → device space. `v`
+/// moves the glyph's origin (vertical writing hangs a glyph from its vertical origin).
+fn glyph_to_device(ip: &Interp, fm: &M, v: (f64, f64)) -> R<M> {
     let (x, y) = ip.gs.cur.ok_or(PsErr::Ps("nocurrentpoint"))?;
     let (ux, uy) = ip.gs.ctm.inv().ok_or(PsErr::Ps("undefinedresult"))?.apply(x, y);
-    Ok(fm.then(&M([1.0, 0.0, 0.0, 1.0, ux, uy])).then(&ip.gs.ctm))
+    Ok(M([1.0, 0.0, 0.0, 1.0, -v.0, -v.1]).then(fm).then(&M([1.0, 0.0, 0.0, 1.0, ux, uy])).then(&ip.gs.ctm))
 }
 
 /// Run one Type 3 glyph at the current point: its advance in glyph space.
@@ -268,6 +269,7 @@ fn show_glyphs(
         Some(f) => f,
         None => return err("invalidfont"),
     };
+    let vertical = crate::composite::vertical(ip, &font);
     let jobs: Vec<(u32, PDict, M, crate::composite::Key2)> = if font.get_name(b"FontType").and_then(|o| o.num()) == Some(0.0) {
         crate::composite::decode(ip, &font, s)?
     } else {
@@ -293,14 +295,26 @@ fn show_glyphs(
                 }
             }
             key => {
+                let cid = match key {
+                    crate::composite::Key2::Cid(cid) => Some(cid),
+                    crate::composite::Key2::Code(_) => None,
+                };
                 let g = match key {
                     crate::composite::Key2::Code(c) => outline(ip, &leaf, c),
                     crate::composite::Key2::Cid(cid) => cid_outline(ip, &leaf, cid),
                 };
+                // Vertical writing: the glyph hangs from its vertical origin and advances down.
+                let em = 1.0 / font_matrix(&leaf).0[3].abs().max(1e-9);
+                let vmetrics = match (vertical, &g) {
+                    (true, Some(g)) => Some(crate::composite::vertical_metrics(&leaf, cid.unwrap_or(0), g.width.0, em)),
+                    (true, None) => Some(crate::composite::vertical_metrics(&leaf, cid.unwrap_or(0), em, em)),
+                    _ => None,
+                };
+                let origin = vmetrics.map_or((0.0, 0.0), |(_, v)| v);
                 match g {
                     Some(g) => {
                         if draw && !g.path.is_empty() && ip.gs.cur.is_some() {
-                            let m = glyph_to_device(ip, &fm)?;
+                            let m = glyph_to_device(ip, &fm, origin)?;
                             let path: Vec<crate::gstate::Seg> = g.path.iter().map(|s| s.map(&m)).collect();
                             if ip.charpath {
                                 ip.gs.path.extend(path);
@@ -308,12 +322,16 @@ fn show_glyphs(
                                 crate::ops::gfx::fill_path(ip, &path, false)?;
                             }
                         }
-                        match (leaf.get_name(b"Metrics"), key_code(code)) {
-                            (Some(_), Some(c)) => estimated_width(&leaf, c),
+                        match (vmetrics, leaf.get_name(b"Metrics"), key_code(code)) {
+                            (Some((w1, _)), _, _) => w1,
+                            (None, Some(_), Some(c)) => estimated_width(&leaf, c),
                             _ => g.width,
                         }
                     }
-                    None => estimated_width(&leaf, key_code(code).unwrap_or(0)),
+                    None => match vmetrics {
+                        Some((w1, _)) => w1,
+                        None => estimated_width(&leaf, key_code(code).unwrap_or(0)),
+                    },
                 }
             }
         };

@@ -953,6 +953,15 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
         cmd!(
+            query "object.graphic",
+            "Placed Graphic",
+            [],
+            None,
+            "{id?} → {kind: image|pdf|eps|svg|psd, mime, name, link, pixels, page, size, bounds, spreadBounds, scale, ppi}: the graphic placed in a frame. size is its natural size (pt); bounds are its corners in the frame's space and spreadBounds on the spread (null for an anchored frame); ppi is its effective resolution. Anchored frames included.",
+            has_doc,
+            graphic_info
+        ),
+        cmd!(
             query "object.labels",
             "Script Labels",
             [],
@@ -1609,6 +1618,48 @@ fn ungroup(s: &mut Session, p: &Value) -> Result<Value> {
         *sel = Selection::items(out);
         ok()
     })
+}
+
+/// What `object.graphic` tells about the graphic in a frame.
+fn graphic_info(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "object.graphic";
+    let id = one_target(s, p, ID)?;
+    let d = &s.doc()?.doc;
+    let it = d.item_any(id).ok_or(designcraft_doc::DocError::NoItem(id))?;
+    let Content::Graphic(g) = &it.content else { return Err(bad(ID, "that frame holds no placed graphic")) };
+    let asset = d.assets.get(&g.asset);
+    let (mime, name) = asset.map_or(("", ""), |a| (a.mime.as_str(), a.name.as_str()));
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let kind = match (mime, ext.as_str()) {
+        (_, "eps" | "ai") | ("application/postscript", _) => "eps",
+        ("application/pdf", _) => "pdf",
+        ("image/svg+xml", _) => "svg",
+        ("image/vnd.adobe.photoshop", _) => "psd",
+        _ => "image",
+    };
+    let natural = Rect::new(0.0, 0.0, g.size.0, g.size.1);
+    let local = g.xf.transform_rect_bbox(natural);
+    // On a spread: through the frame and the groups it sits in.
+    let spread = d.find(id).map(|loc| (d.parent_xf(&loc) * it.xf * g.xf).transform_rect_bbox(natural));
+    let [a, b, c, dd, ..] = g.xf.as_coeffs();
+    let (sx, sy) = (a.hypot(b), c.hypot(dd));
+    let pixels = asset.and_then(|a| a.pixels);
+    let ppi = pixels
+        .filter(|_| g.size.0 > 0.0 && g.size.1 > 0.0 && sx > 0.0 && sy > 0.0)
+        .map(|(w, h)| [f64::from(w) * 72.0 / (g.size.0 * sx), f64::from(h) * 72.0 / (g.size.1 * sy)]);
+    Ok(json!({
+        "kind": kind,
+        "mime": mime,
+        "name": name,
+        "link": asset.and_then(|a| a.link.clone()),
+        "pixels": pixels,
+        "page": asset.map_or(0, |a| a.page + 1),
+        "size": [g.size.0, g.size.1],
+        "bounds": [local.x0, local.y0, local.x1, local.y1],
+        "spreadBounds": spread.map(|r| [r.x0, r.y0, r.x1, r.y1]),
+        "scale": [sx, sy],
+        "ppi": ppi,
+    }))
 }
 
 /// The one object a query is about: `id`, or the single selected object.
@@ -3643,5 +3694,48 @@ mod script_label_tests {
         assert!(s.execute("object.extractLabel", &json!({"id": 999_999, "key": "k"})).is_err(), "no object");
         assert!(s.execute("object.insertLabel", &json!({"key": "k", "value": "v", "ids": [999_999]})).is_err());
         assert!(s.execute("object.labels", &json!({"ids": [a, free]})).is_err(), "one object at a time");
+    }
+}
+
+#[cfg(test)]
+mod graphic_info_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn a_frames_graphic_reports_its_kind_size_bounds_and_resolution() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        // A 20 × 10 pixel PNG: 20 × 10 points at 72 ppi.
+        let png = designcraft_render::Rendered { width: 20, height: 10, pixels: vec![255; 20 * 10 * 4] }.to_png();
+        let r = s.execute("file.place", &json!({"base64": super::super::file::base64_encode(&png), "name": "logo.png", "x": 100, "y": 200})).unwrap();
+        let id = r["id"].as_u64().unwrap();
+        let g = s.execute("object.graphic", &json!({"id": id})).unwrap();
+        assert_eq!(g["kind"], "image");
+        assert_eq!(g["name"], "logo.png");
+        assert_eq!(g["pixels"], json!([20, 10]));
+        assert_eq!(g["size"], json!([20.0, 10.0]));
+        assert_eq!(g["ppi"], json!([72.0, 72.0]));
+        let sb: Vec<f64> = g["spreadBounds"].as_array().unwrap().iter().filter_map(|v| v.as_f64()).collect();
+        assert!((sb[2] - sb[0] - 20.0).abs() < 1e-6 && (sb[3] - sb[1] - 10.0).abs() < 1e-6, "{sb:?}");
+
+        // Half size: twice the resolution.
+        s.execute("object.fit", &json!({"mode": "fitContentToFrame", "ids": [id]})).unwrap();
+        s.execute("transform.set", &json!({"width": 10, "height": 5, "ids": [id]})).unwrap();
+        s.execute("object.fit", &json!({"mode": "fitContentToFrame", "ids": [id]})).unwrap();
+        let g = s.execute("object.graphic", &json!({"id": id})).unwrap();
+        let ppi: Vec<f64> = g["ppi"].as_array().unwrap().iter().filter_map(|v| v.as_f64()).collect();
+        assert!((ppi[0] - 144.0).abs() < 1e-6 && (ppi[1] - 144.0).abs() < 1e-6, "{g}");
+
+        // Anchored in text: no spread bounds, the rest the same.
+        let t = s.execute("frame.create", &json!({"rect": [72, 72, 400, 300], "content": "text", "text": "Picture: here"})).unwrap();
+        s.execute("anchored.insert", &json!({"ids": [id], "story": t["story"], "pos": 9})).unwrap();
+        let g = s.execute("object.graphic", &json!({"id": id})).unwrap();
+        assert!(g["spreadBounds"].is_null() && g["kind"] == "image", "{g}");
+
+        // A frame without a graphic, or no frame: errors.
+        assert!(s.execute("object.graphic", &json!({"id": t["id"]})).is_err());
+        assert!(s.execute("object.graphic", &json!({"id": 999_999})).is_err());
     }
 }

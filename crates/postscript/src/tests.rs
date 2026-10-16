@@ -381,3 +381,48 @@ fn a_tiny_dash_on_a_long_path_draws_solid() {
     let (c, _) = run(&format!("{body} strokepath fill"));
     assert!(c.matches(" m").count() < 10, "{}", &c[..c.len().min(300)]);
 }
+
+#[test]
+fn metrics_without_two_numbers_dont_underflow() {
+    // `[/a /b]` has two elements but no numbers: the width index used to go below zero.
+    let (c, _) = run("/Helvetica findfont dup length 1 add dict copy dup /Metrics << /A [/a /b] /B [7] >> put
+                      /H exch definefont 10 scalefont setfont 10 20 moveto (AB) show 10 20 1 1 rectfill");
+    assert!(c.contains("re") || c.contains(" m"), "{c}");
+}
+
+#[test]
+fn work_in_proportion_to_operands_counts_against_the_limits() {
+    let limits = Limits { steps: 200_000, memory: 8 << 20 };
+    let ends = |body: &str| {
+        let r = eps_to_pdf(&eps(&format!("10 20 1 1 rectfill {body}")), limits).expect("what was painted is kept");
+        let w = r.warnings.join(" ");
+        assert!(w.contains("too long") || w.contains("memory") || w.contains("too much data"), "{body}: {w}");
+        // It stops at the charge that crosses the limit: overshoot is one operand's worth at most.
+        assert!(r.steps <= limits.steps + 1_000_000 || r.memory > limits.memory, "{body}: {} steps", r.steps);
+    };
+    // Each would take seconds to minutes in a few steps without its charge.
+    ends("/h 1000000 string def /n 500 string def { h n search pop pop } loop");
+    ends("100000 { 0 } repeat { 100000 copy 100000 { pop } repeat } loop");
+    ends("/a 4000000 string def /b 4000000 string def { a b eq pop } loop");
+    ends("newpath 0 0 moveto 100000 { 1 0 rlineto } repeat { gsave grestore } loop");
+    ends("{ 4000000 string pop } loop");
+    ends("/d 100000 dict def 0 1 99999 { d exch 0 put } for { d { pop pop } forall } loop");
+    ends("/Helvetica findfont 10 scalefont setfont /s 1000000 string def { 0 0 moveto s show } loop");
+    ends("mark 100000 { 0 } repeat { counttomark pop } loop");
+    // Reading counts: a stream decoded over and over.
+    let z = miniz_oxide::deflate::compress_to_vec_zlib(&vec![0u8; 1 << 20], 9);
+    let hex: String = z.iter().map(|b| format!("{b:02x}")).collect();
+    ends(&format!("/z <{hex}> def {{ z /FlateDecode filter dup 2000000 string readstring pop pop closefile }} loop"));
+    // Tiny programs that only loop still end at the step limit.
+    ends("{ } loop");
+}
+
+#[test]
+fn the_web_gets_smaller_default_limits() {
+    let l = Limits::default();
+    if cfg!(target_arch = "wasm32") {
+        assert!(l.memory <= 256 << 20 && l.steps <= 20_000_000);
+    } else {
+        assert!(l.memory <= 1 << 30 && l.steps <= 50_000_000);
+    }
+}

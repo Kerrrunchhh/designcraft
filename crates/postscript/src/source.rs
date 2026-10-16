@@ -43,6 +43,12 @@ pub enum Dec {
 
 pub enum Kind {
     Bytes(Rc<Vec<u8>>),
+    /// A window onto a string's storage, read in place (`token`, executing a string).
+    Shared {
+        buf: Rc<std::cell::RefCell<Vec<u8>>>,
+        off: usize,
+        len: usize,
+    },
     /// Decrypting `eexec` over another file. `hex` is decided by the first four bytes.
     Eexec {
         up: usize,
@@ -79,6 +85,11 @@ impl Source {
 
     pub fn shared(data: Rc<Vec<u8>>) -> Self {
         Self::of(Kind::Bytes(data))
+    }
+
+    /// A string read in place, without copying it.
+    pub fn string(s: &crate::obj::PStr) -> Self {
+        Self::of(Kind::Shared { buf: s.buf.clone(), off: s.off, len: s.len })
     }
 
     pub fn eexec(up: usize) -> Self {
@@ -124,9 +135,20 @@ pub struct Predictor {
 }
 
 /// The sources, read through one another (`eexec` over the program, filters over both).
-#[derive(Default)]
 pub struct Sources {
     pub list: Vec<Source>,
+    /// Bytes read so far, at every level (a filter's input and its output both count): the
+    /// interpreter charges them as work.
+    pub read: u64,
+    /// The most bytes that may be read; past it every file is at its end and `exhausted` is set.
+    pub max_read: u64,
+    pub exhausted: bool,
+}
+
+impl Default for Sources {
+    fn default() -> Self {
+        Sources { list: Vec::new(), read: 0, max_read: u64::MAX, exhausted: false }
+    }
 }
 
 impl Sources {
@@ -140,6 +162,18 @@ impl Sources {
     }
 
     fn read_depth(&mut self, id: usize, depth: usize) -> Option<u8> {
+        if self.read >= self.max_read {
+            self.exhausted = true;
+            return None;
+        }
+        let c = self.read_inner(id, depth);
+        if c.is_some() {
+            self.read += 1;
+        }
+        c
+    }
+
+    fn read_inner(&mut self, id: usize, depth: usize) -> Option<u8> {
         if depth > MAX_CHAIN {
             return None;
         }
@@ -154,6 +188,13 @@ impl Sources {
         let c = match &mut src.kind {
             Kind::Bytes(data) => {
                 let c = data.get(src.pos).copied();
+                if c.is_some() {
+                    src.pos += 1;
+                }
+                return c;
+            }
+            Kind::Shared { buf, off, len } => {
+                let c = if src.pos < *len { off.checked_add(src.pos).and_then(|i| buf.borrow().get(i).copied()) } else { None };
                 if c.is_some() {
                     src.pos += 1;
                 }
@@ -242,7 +283,7 @@ impl Sources {
     pub fn unread_many(&mut self, id: usize, bytes: &[u8]) {
         let Some(src) = self.list.get_mut(id) else { return };
         match src.kind {
-            Kind::Bytes(_) if src.back.is_empty() => src.pos = src.pos.saturating_sub(bytes.len()),
+            Kind::Bytes(_) | Kind::Shared { .. } if src.back.is_empty() => src.pos = src.pos.saturating_sub(bytes.len()),
             _ => src.back.extend(bytes.iter().rev()),
         }
     }
@@ -251,7 +292,7 @@ impl Sources {
     pub fn unread(&mut self, id: usize) {
         let Some(src) = self.list.get_mut(id) else { return };
         match src.kind {
-            Kind::Bytes(_) if src.back.is_empty() => src.pos = src.pos.saturating_sub(1),
+            Kind::Bytes(_) | Kind::Shared { .. } if src.back.is_empty() => src.pos = src.pos.saturating_sub(1),
             _ => {
                 if let Some(c) = src.last {
                     src.back.push(c);
@@ -623,7 +664,7 @@ impl Sources {
 
     pub fn reset(&mut self, id: usize) {
         if let Some(s) = self.list.get_mut(id)
-            && let Kind::Bytes(_) = s.kind
+            && matches!(s.kind, Kind::Bytes(_) | Kind::Shared { .. })
         {
             s.pos = 0;
             s.back.clear();
@@ -638,7 +679,7 @@ impl Sources {
 
     pub fn set_position(&mut self, id: usize, pos: usize) -> bool {
         match self.list.get_mut(id) {
-            Some(s) if matches!(&s.kind, Kind::Bytes(d) if pos <= d.len()) => {
+            Some(s) if matches!(&s.kind, Kind::Bytes(d) if pos <= d.len()) || matches!(&s.kind, Kind::Shared { len, .. } if pos <= *len) => {
                 s.pos = pos;
                 s.back.clear();
                 s.closed = false;
@@ -652,6 +693,9 @@ impl Sources {
         match self.list.get(id) {
             Some(s) if s.closed => -1,
             Some(Source { kind: Kind::Bytes(d), pos, back, .. }) => i64::try_from(d.len().saturating_sub(*pos) + back.len()).unwrap_or(i64::MAX),
+            Some(Source { kind: Kind::Shared { len, .. }, pos, back, .. }) => {
+                i64::try_from(len.saturating_sub(*pos) + back.len()).unwrap_or(i64::MAX)
+            }
             Some(_) => 1,
             None => -1,
         }

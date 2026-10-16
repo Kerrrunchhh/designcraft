@@ -92,10 +92,26 @@ pub struct Limits {
 }
 
 impl Default for Limits {
+    /// Generous for real EPS files: an Illustrator file with its procsets takes about 0.6 million
+    /// steps and 2 MB, one carrying a 15 MB CJK font 2 million steps and 30 MB. A program that
+    /// runs into the step limit ends within a few seconds. Smaller on the web.
     fn default() -> Self {
-        Limits { steps: 200_000_000, memory: 1 << 30 }
+        if cfg!(target_arch = "wasm32") { Limits { steps: 20_000_000, memory: 256 << 20 } } else { Limits { steps: 50_000_000, memory: 1 << 30 } }
     }
 }
+
+/// Memory a path segment and a graphics state take.
+pub const SEG_BYTES: usize = std::mem::size_of::<crate::gstate::Seg>();
+pub const GSTATE_BYTES: usize = 512;
+
+/// Content-stream bytes one written path segment takes, about.
+pub const OUT_SEG_BYTES: usize = 24;
+
+/// Memory a file takes (charged when one is made).
+pub const SOURCE_BYTES: usize = 128;
+
+/// Bytes read, copied or scanned per step of work charged.
+pub const BYTES_PER_STEP: u64 = 16;
 
 const MAX_OSTACK: usize = 500_000;
 const MAX_ESTACK: usize = 100_000;
@@ -126,6 +142,9 @@ pub struct Interp {
     pub limits: Limits,
     pub steps: u64,
     pub memory: usize,
+    /// How many of `srcs.read` have been charged as steps, and of the segments written.
+    pub read_charged: u64,
+    pub written_charged: u64,
     pub depth: usize,
     pub next_fid: usize,
     pub main: usize,
@@ -148,7 +167,7 @@ pub struct Interp {
 
 impl Interp {
     pub fn new(program: Vec<u8>, origin: (f64, f64), limits: Limits) -> Self {
-        let mut srcs = Sources::default();
+        let mut srcs = Sources { max_read: limits.steps.saturating_mul(BYTES_PER_STEP), ..Sources::default() };
         let main = srcs.add(Source::bytes(program));
         let systemdict = PDict::new(1000);
         let globaldict = PDict::new(100);
@@ -174,6 +193,8 @@ impl Interp {
             limits,
             steps: 0,
             memory: 0,
+            read_charged: 0,
+            written_charged: 0,
             depth: 0,
             next_fid: 1,
             main,
@@ -274,6 +295,21 @@ impl Interp {
         matrix_of(&a)
     }
 
+    /// Charge `units` steps of work (elements visited, or [`BYTES_PER_STEP`] bytes each): what an
+    /// operator does in proportion to its operands counts against the step limit, checked as it
+    /// goes rather than after.
+    pub fn charge(&mut self, units: u64) -> R {
+        self.steps = self.steps.saturating_add(units);
+        if self.steps > self.limits.steps { Err(PsErr::Fatal("the program runs too long".into())) } else { Ok(()) }
+    }
+
+    /// Charge work for `n` bytes handled.
+    pub fn charge_bytes(&mut self, n: usize) -> R {
+        self.charge((n as u64) / BYTES_PER_STEP + 1)
+    }
+
+    /// Charge memory for `n` bytes made (new objects and copies alike; the cap bounds what one
+    /// conversion makes in all, not only what it keeps).
     pub fn alloc(&mut self, n: usize) -> R {
         self.memory = self.memory.saturating_add(n);
         if self.memory > self.limits.memory { Err(PsErr::Fatal("out of memory".into())) } else { Ok(()) }
@@ -333,7 +369,9 @@ impl Interp {
             }
             Obj::Op(op) => self.call_op(op),
             Obj::Str(s, true) => {
-                let id = self.srcs.add(Source::bytes(s.bytes()));
+                // A string runs as a file reading it in place.
+                self.alloc(SOURCE_BYTES)?;
+                let id = self.srcs.add(Source::string(&s));
                 self.push_frame(Frame::File { id })
             }
             Obj::File(id) => self.push_frame(Frame::File { id }),
@@ -379,9 +417,21 @@ impl Interp {
     }
 
     fn step(&mut self) -> R {
-        self.steps += 1;
-        if self.steps > self.limits.steps {
-            return Err(PsErr::Fatal("the program runs too long".into()));
+        // Bytes read since the last step are work too (decoding included).
+        let read = self.srcs.read;
+        let fresh = read.saturating_sub(self.read_charged);
+        self.read_charged = read;
+        self.charge(1 + fresh / BYTES_PER_STEP)?;
+        // So is what was written: re-emitted clips included.
+        let written = self.out.segments() as u64;
+        let fresh = written.saturating_sub(self.written_charged);
+        if fresh > 0 {
+            self.written_charged = written;
+            self.charge(fresh / 4)?;
+            self.alloc(usize::try_from(fresh).unwrap_or(usize::MAX).saturating_mul(OUT_SEG_BYTES))?;
+        }
+        if self.srcs.exhausted {
+            return Err(PsErr::Fatal("the program reads too much data".into()));
         }
         let Some(frame) = self.e.last_mut() else { return Ok(()) };
         match frame {
@@ -399,9 +449,14 @@ impl Interp {
             }
             Frame::File { id } => {
                 let id = *id;
-                let d = self.d.clone();
+                let d = &self.d;
                 let mut resolve = |n: &[u8]| d.iter().rev().find_map(|dict| dict.get(&Key::Name(name(n))));
-                match scan::next(&mut self.srcs, id, &mut resolve) {
+                let before = self.srcs.read;
+                let token = scan::next(&mut self.srcs, id, &mut resolve);
+                // What the scanner read became objects: memory.
+                let scanned = usize::try_from(self.srcs.read.saturating_sub(before)).unwrap_or(usize::MAX);
+                self.alloc(scanned)?;
+                match token {
                     Ok(Some(o)) => self.exec_direct(o),
                     Ok(None) => {
                         self.e.pop();
@@ -568,8 +623,22 @@ impl Interp {
         if self.gstack.len() >= MAX_GSTACK {
             return err("limitcheck");
         }
+        self.charge_gstate()?;
         self.gstack.push(self.gs.clone());
         Ok(())
+    }
+
+    /// Copying the graphics state copies its path: work and memory in proportion.
+    pub fn charge_gstate(&mut self) -> R {
+        let n = self.gs.path.len() + self.gs.dash.0.len() + self.gs.clip_saves.len() + self.gs.color.len();
+        self.charge(n as u64 / 4 + 1)?;
+        self.alloc(n.saturating_mul(SEG_BYTES).saturating_add(GSTATE_BYTES))
+    }
+
+    /// Charge work and memory for copying or walking `n` path segments.
+    pub fn charge_path(&mut self, n: usize) -> R {
+        self.charge(n as u64 / 4 + 1)?;
+        self.alloc(n.saturating_mul(SEG_BYTES))
     }
 
     pub fn grestore(&mut self) {

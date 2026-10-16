@@ -16,7 +16,14 @@ fn main() -> std::process::ExitCode {
     let t = std::time::Instant::now();
     match designcraft_postscript::eps_to_pdf(&bytes, designcraft_postscript::Limits::default()) {
         Ok(c) => {
-            eprintln!("{input}: {:.0} ms, bbox {:?}, {} warnings", t.elapsed().as_secs_f64() * 1000.0, c.bbox, c.warnings.len());
+            eprintln!(
+                "{input}: {:.0} ms, bbox {:?}, {} warnings, {} steps, {} KiB",
+                t.elapsed().as_secs_f64() * 1000.0,
+                c.bbox,
+                c.warnings.len(),
+                c.steps,
+                c.memory / 1024
+            );
             for w in c.warnings.iter().take(20) {
                 eprintln!("  {w}");
             }

@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use crate::gstate::M;
-use crate::interp::{Interp, PsErr, R, err, matrix_obj};
+use crate::interp::{Interp, R, err, matrix_obj};
 use crate::obj::{Key, Obj, PArr, PDict, PStr, name};
 use crate::type1::Glyph;
 
@@ -66,6 +66,18 @@ impl Interp {
         if depth < 8 { m.parent.and_then(|p| self.cid(p, code, depth + 1)) } else { None }
     }
 
+    /// How many ranges a lookup through CMap `i` may compare.
+    fn cmap_cost(&self, i: usize) -> u64 {
+        let mut n = 0u64;
+        let mut cur = Some(i);
+        for _ in 0..8 {
+            let Some(m) = cur.and_then(|c| self.cmaps.get(c)) else { break };
+            n = n.saturating_add((m.ranges.len() + m.codespace.len()) as u64);
+            cur = m.parent;
+        }
+        n
+    }
+
     fn code_len(&self, i: usize, s: &[u8], depth: usize) -> Option<usize> {
         let m = self.cmaps.get(i)?;
         for n in 1..=4 {
@@ -110,7 +122,7 @@ pub fn begin_block(ip: &mut Interp) -> R {
 }
 
 fn block(ip: &mut Interp) -> R<Vec<Obj>> {
-    let i = ip.o.iter().rposition(|o| matches!(o, Obj::Mark)).ok_or(PsErr::Ps("unmatchedmark"))?;
+    let i = crate::ops::basic::mark_pos(ip)?;
     let items = ip.o.split_off(i + 1);
     ip.o.pop();
     Ok(items)
@@ -267,6 +279,9 @@ pub fn startdata(ip: &mut Interp) -> R {
     {
         ip.d.pop();
     }
+    // Parsing walks the data, and a font set's glyph tables are as large again.
+    ip.charge_bytes(data.len())?;
+    ip.alloc(data.len())?;
     let Some(set) = crate::cff::parse(data) else {
         ip.warnings.push("unreadable CFF font set".into());
         return Ok(());
@@ -436,7 +451,10 @@ pub fn decode(ip: &mut Interp, font: &PDict, s: &[u8]) -> R<Vec<(u32, PDict, M, 
     };
     let m = font_matrix(&first).then(&fm);
     let mut i = 0;
+    // Each code is looked up through the CMap's ranges (and its parents').
+    let per_code = cmap.map_or(1, |c| ip.cmap_cost(c)) / 16 + 1;
     while i < s.len() {
+        ip.charge(per_code)?;
         let rest = s.get(i..).unwrap_or(&[]);
         let n = cmap.and_then(|c| ip.code_len(c, rest, 0)).unwrap_or(2).min(rest.len()).max(1);
         let code = rest.get(..n).unwrap_or(&[]);

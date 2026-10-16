@@ -77,5 +77,5 @@ pub fn glyph(data: &[u8], gid: u32) -> Option<Glyph> {
         let _ = g.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::default()), &mut pen);
     }
     let adv = f.glyph_metrics(Size::unscaled(), LocationRef::default()).advance_width(GlyphId::new(gid)).map_or(0.0, f64::from) / upem;
-    Some(Glyph { path: pen.path, width: (adv, 0.0) })
+    Some(Glyph { cost: pen.path.len() * 4 + 16, path: pen.path, width: (adv, 0.0) })
 }

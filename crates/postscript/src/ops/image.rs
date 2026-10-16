@@ -102,6 +102,7 @@ fn samples(ip: &mut Interp, p: &Params, comps: usize) -> R<(Vec<u8>, bool)> {
         return err("limitcheck");
     }
     ip.alloc(total)?;
+    ip.charge_bytes(total)?;
     if p.sources.len() <= 1 {
         let row = (p.w * comps * p.bpc).div_ceil(8);
         let src = p.sources.first().cloned().ok_or(PsErr::Ps("typecheck"))?;
@@ -217,6 +218,9 @@ fn paint(ip: &mut Interp, p: Params, space: Space) -> R {
         ip.warnings.push("image in an unsupported colour space skipped".into());
         return Ok(());
     }
+    // Converting each pixel: work and the converted copy.
+    ip.charge(data.len() as u64 / 4 + 1)?;
+    ip.alloc(p.w.saturating_mul(p.h).saturating_mul(4))?;
     let mut rgb = Vec::with_capacity(p.w * p.h * 4);
     if comps == 1 {
         let mut table = Vec::with_capacity(256);

@@ -589,7 +589,7 @@ impl FontSet {
             Some(w) if w.is_finite() => private.nominal_width + w,
             _ => private.default_width,
         };
-        Some(Glyph { path: run.path, width: (w, 0.0) })
+        Some(Glyph { cost: run.ops + run.path.len(), path: run.path, width: (w, 0.0) })
     }
 
     /// The glyph index of a CID in font `k`.

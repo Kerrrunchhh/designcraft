@@ -154,7 +154,9 @@ fn estimated_width(font: &PDict, code: u8) -> (f64, f64) {
         match v {
             Obj::Array(a, _) if a.len >= 2 => {
                 let n: Vec<f64> = a.items().iter().filter_map(Obj::num).collect();
-                return (n.get(n.len() - 2).copied().unwrap_or(0.0), n.last().copied().unwrap_or(0.0));
+                // The last two numbers are the width (an entry without two numbers gives none).
+                let w = n.len().checked_sub(2).and_then(|i| n.get(i)).copied().unwrap_or(0.0);
+                return (w, n.last().copied().unwrap_or(0.0));
             }
             o => return (o.num().unwrap_or(0.0), 0.0),
         }
@@ -199,6 +201,9 @@ fn outline(ip: &mut Interp, font: &PDict, code: u8) -> Option<std::rc::Rc<crate:
         let std = crate::encodings::standard();
         std::rc::Rc::new(crate::type1::glyph(font, &g, &std)?)
     };
+    // Running the glyph's program was work; failing to charge it ends the run at the next step.
+    let _ = ip.charge(glyph.cost as u64 / 4 + 1);
+    let _ = ip.alloc(glyph.path.len().saturating_mul(crate::interp::SEG_BYTES));
     if ip.glyphs.len() < 100_000 {
         ip.glyphs.insert((fid, g), glyph.clone());
     }
@@ -216,6 +221,8 @@ fn cid_outline(ip: &mut Interp, font: &PDict, cid: u32) -> Option<std::rc::Rc<cr
         return Some(hit.clone());
     }
     let g = std::rc::Rc::new(crate::composite::cid_glyph(ip, font, cid)?);
+    let _ = ip.charge(g.cost as u64 / 4 + 1);
+    let _ = ip.alloc(g.path.len().saturating_mul(crate::interp::SEG_BYTES));
     if ip.glyphs.len() < 100_000 {
         ip.glyphs.insert(key, g.clone());
     }
@@ -270,6 +277,8 @@ fn show_glyphs(
         None => return err("invalidfont"),
     };
     let vertical = crate::composite::vertical(ip, &font);
+    // The list of glyphs is made first: at most one per byte.
+    ip.alloc(s.len().saturating_mul(GLYPH_JOB_BYTES))?;
     let jobs: Vec<(u32, PDict, M, crate::composite::Key2)> = if font.get_name(b"FontType").and_then(|o| o.num()) == Some(0.0) {
         crate::composite::decode(ip, &font, s)?
     } else {
@@ -278,6 +287,7 @@ fn show_glyphs(
     };
     let mut total = (0.0, 0.0);
     for (i, (code, leaf, fm, key)) in jobs.into_iter().enumerate() {
+        ip.charge(GLYPH_STEPS)?;
         let type3 = leaf.get_name(b"FontType").and_then(|o| o.num()) == Some(3.0);
         let w = match key {
             crate::composite::Key2::Code(c) if type3 => {
@@ -314,6 +324,7 @@ fn show_glyphs(
                 match g {
                     Some(g) => {
                         if draw && !g.path.is_empty() && ip.gs.cur.is_some() {
+                            ip.charge_path(g.path.len())?;
                             let m = glyph_to_device(ip, &fm, origin)?;
                             let path: Vec<crate::gstate::Seg> = g.path.iter().map(|s| s.map(&m)).collect();
                             if ip.charpath {
@@ -346,6 +357,11 @@ fn show_glyphs(
     }
     Ok(total)
 }
+
+/// What showing one glyph costs, in steps (it takes about ten times a plain operator), and the
+/// memory its place in the list of glyphs takes.
+const GLYPH_STEPS: u64 = 10;
+const GLYPH_JOB_BYTES: usize = 96;
 
 fn key_code(code: u32) -> Option<u8> {
     u8::try_from(code).ok()

@@ -377,6 +377,11 @@ impl Out {
     }
 
     /// The PDF: one page of `size`, its content, images and shadings.
+    /// Path segments written so far (clips included).
+    pub fn segments(&self) -> usize {
+        self.segments
+    }
+
     pub fn finish(self, size: (f64, f64)) -> Vec<u8> {
         let mut pdf = Pdf::new();
         // Nothing newer is used (no transparency groups): PDF/X-1a files can take it.

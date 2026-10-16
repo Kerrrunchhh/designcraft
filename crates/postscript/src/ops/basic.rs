@@ -27,6 +27,8 @@ pub fn copy(ip: &mut Interp) -> R {
             let n = usize::try_from(n).map_err(|_| PsErr::Ps("rangecheck"))?;
             ip.need(n)?;
             let start = ip.o.len() - n;
+            ip.charge(n as u64)?;
+            ip.alloc(n.saturating_mul(OBJ_BYTES))?;
             let items: Vec<Obj> = ip.o.get(start..).map(<[Obj]>::to_vec).unwrap_or_default();
             for o in items {
                 ip.push(o)?;
@@ -38,6 +40,8 @@ pub fn copy(ip: &mut Interp) -> R {
             if src.len > dst.len {
                 return err("rangecheck");
             }
+            ip.charge(src.len as u64)?;
+            ip.alloc(src.len.saturating_mul(OBJ_BYTES))?;
             for (i, o) in src.items().into_iter().enumerate() {
                 dst.set(i, o);
             }
@@ -46,11 +50,15 @@ pub fn copy(ip: &mut Interp) -> R {
         }
         Obj::Str(dst, x) => {
             let src = ip.pop_str()?;
+            ip.charge_bytes(src.len)?;
+            ip.alloc(src.len)?;
             let w = dst.put_bytes(0, &src.bytes()).ok_or(PsErr::Ps("rangecheck"))?;
             ip.push(Obj::Str(w, x))
         }
         Obj::Dict(dst) => {
             let src = ip.pop_dict()?;
+            ip.charge(src.len() as u64)?;
+            ip.alloc(src.len().saturating_mul(2 * OBJ_BYTES))?;
             for (k, v) in src.entries() {
                 dst.put(k, v);
             }
@@ -95,8 +103,23 @@ pub fn mark(ip: &mut Interp) -> R {
     ip.push(Obj::Mark)
 }
 
-fn mark_pos(ip: &Interp) -> R<usize> {
-    ip.o.iter().rposition(|o| matches!(o, Obj::Mark)).ok_or(PsErr::Ps("unmatchedmark"))
+/// Where the topmost mark is; the search is work (a deep stack takes long).
+pub fn mark_pos(ip: &mut Interp) -> R<usize> {
+    let i = ip.o.iter().rposition(|o| matches!(o, Obj::Mark));
+    ip.charge((ip.o.len() - i.map_or(0, |i| i + 1)) as u64)?;
+    i.ok_or(PsErr::Ps("unmatchedmark"))
+}
+
+/// Memory one object takes, for charging copies of arrays and stacks.
+pub const OBJ_BYTES: usize = 32;
+
+/// A string used as a dictionary key is copied into a name: work and memory.
+pub fn key_cost(ip: &mut Interp, k: &Obj) -> R {
+    if let Obj::Str(s, _) = k {
+        ip.charge_bytes(s.len)?;
+        ip.alloc(s.len)?;
+    }
+    Ok(())
 }
 
 pub fn cleartomark(ip: &mut Interp) -> R {
@@ -115,7 +138,7 @@ pub fn array_close(ip: &mut Interp) -> R {
     let i = mark_pos(ip)?;
     let items = ip.o.split_off(i + 1);
     ip.o.pop();
-    ip.alloc(items.len() * 16)?;
+    ip.alloc(items.len().saturating_mul(OBJ_BYTES))?;
     ip.push(Obj::Array(PArr::new(items), false))
 }
 
@@ -125,6 +148,10 @@ pub fn dict_close(ip: &mut Interp) -> R {
     ip.o.pop();
     if !items.len().is_multiple_of(2) {
         return err("rangecheck");
+    }
+    ip.alloc(items.len().saturating_mul(OBJ_BYTES))?;
+    for k in items.iter().step_by(2) {
+        key_cost(ip, k)?;
     }
     let d = PDict::new(items.len() / 2);
     let mut it = items.into_iter();
@@ -307,21 +334,39 @@ pub fn rrand(ip: &mut Interp) -> R {
 
 // ----- relations, booleans, bits -----
 
+/// Comparing strings compares (and copies) their bytes.
+fn compare_cost(ip: &mut Interp, a: &Obj, b: &Obj) -> R {
+    let len = |o: &Obj| match o {
+        Obj::Str(s, _) => s.len,
+        Obj::Name(n, _) => n.len(),
+        _ => 0,
+    };
+    if matches!(a, Obj::Str(..)) || matches!(b, Obj::Str(..)) {
+        let n = len(a).saturating_add(len(b));
+        ip.charge_bytes(n)?;
+        ip.alloc(n)?;
+    }
+    Ok(())
+}
+
 pub fn eq(ip: &mut Interp) -> R {
     let b = ip.pop()?;
     let a = ip.pop()?;
+    compare_cost(ip, &a, &b)?;
     ip.push(Obj::Bool(a.ps_eq(&b)))
 }
 
 pub fn ne(ip: &mut Interp) -> R {
     let b = ip.pop()?;
     let a = ip.pop()?;
+    compare_cost(ip, &a, &b)?;
     ip.push(Obj::Bool(!a.ps_eq(&b)))
 }
 
 fn compare(ip: &mut Interp, f: fn(std::cmp::Ordering) -> bool) -> R {
     let b = ip.pop()?;
     let a = ip.pop()?;
+    compare_cost(ip, &a, &b)?;
     let ord = match (&a, &b) {
         (Obj::Str(x, _), Obj::Str(y, _)) => x.bytes().cmp(&y.bytes()),
         _ => {
@@ -444,6 +489,8 @@ pub fn loop_(ip: &mut Interp) -> R {
 }
 
 pub fn exit(ip: &mut Interp) -> R {
+    let depth = ip.e.len() as u64;
+    ip.charge(depth / 16)?;
     let i = ip.e.iter().rposition(|f| f.is_loop() || matches!(f, Frame::Stopped | Frame::Barrier)).ok_or(PsErr::Ps("invalidexit"))?;
     if !ip.e.get(i).is_some_and(Frame::is_loop) {
         return err("invalidexit");
@@ -471,7 +518,12 @@ pub fn forall(ip: &mut Interp) -> R {
     match ip.pop()? {
         Obj::Array(arr, _) => ip.push_frame(Frame::ForallArr { arr, i: 0, proc }),
         Obj::Str(s, _) => ip.push_frame(Frame::ForallStr { s, i: 0, proc }),
-        Obj::Dict(d) => ip.push_frame(Frame::ForallDict { items: d.entries(), i: 0, proc }),
+        Obj::Dict(d) => {
+            // The entries are copied first (the procedure may change the dictionary).
+            ip.charge(d.len() as u64)?;
+            ip.alloc(d.len().saturating_mul(2 * OBJ_BYTES))?;
+            ip.push_frame(Frame::ForallDict { items: d.entries(), i: 0, proc })
+        }
         _ => err("typecheck"),
     }
 }
@@ -485,6 +537,7 @@ pub fn execstack(ip: &mut Interp) -> R {
     let a = ip.pop_arr()?;
     let n = ip.e.len().min(a.len);
     let sub = a.interval(0, n).ok_or(PsErr::Ps("rangecheck"))?;
+    ip.charge(n as u64)?;
     for i in 0..n {
         sub.set(i, Obj::Null);
     }
@@ -537,6 +590,7 @@ pub fn cvi(ip: &mut Interp) -> R {
     let v = match ip.pop()? {
         Obj::Int(i) => i,
         Obj::Real(r) if r.is_finite() && r.abs() < 2.2e9 => r.trunc() as i64,
+        Obj::Str(s, _) if s.len > 4096 => return err("limitcheck"),
         Obj::Str(s, _) => match crate::scan::number(&s.bytes()) {
             Some(o) => o.num().filter(|v| v.abs() < 2.2e9).ok_or(PsErr::Ps("rangecheck"))?.trunc() as i64,
             None => return err("syntaxerror"),
@@ -550,6 +604,7 @@ pub fn cvi(ip: &mut Interp) -> R {
 pub fn cvr(ip: &mut Interp) -> R {
     let v = match ip.pop()? {
         o @ (Obj::Int(_) | Obj::Real(_)) => o.num().unwrap_or(0.0),
+        Obj::Str(s, _) if s.len > 4096 => return err("limitcheck"),
         Obj::Str(s, _) => crate::scan::number(&s.bytes()).and_then(|o| o.num()).ok_or(PsErr::Ps("syntaxerror"))?,
         _ => return err("typecheck"),
     };
@@ -558,7 +613,11 @@ pub fn cvr(ip: &mut Interp) -> R {
 
 pub fn cvn(ip: &mut Interp) -> R {
     match ip.pop()? {
-        Obj::Str(s, x) => ip.push(Obj::Name(name(&s.bytes()), x)),
+        Obj::Str(s, x) => {
+            ip.charge_bytes(s.len)?;
+            ip.alloc(s.len)?;
+            ip.push(Obj::Name(name(&s.bytes()), x))
+        }
         n @ Obj::Name(..) => ip.push(n),
         _ => err("typecheck"),
     }
@@ -592,6 +651,7 @@ pub fn text_of(o: &Obj) -> Vec<u8> {
 pub fn cvs(ip: &mut Interp) -> R {
     let dst = ip.pop_str()?;
     let o = ip.pop()?;
+    ip.charge_bytes(dst.len)?;
     let t = text_of(&o);
     let w = dst.put_bytes(0, &t).ok_or(PsErr::Ps("rangecheck"))?;
     ip.push(Obj::Str(w, false))
@@ -655,13 +715,15 @@ pub fn end(ip: &mut Interp) -> R {
 pub fn def(ip: &mut Interp) -> R {
     let v = ip.pop()?;
     let k = ip.pop()?;
-    ip.alloc(32)?;
+    key_cost(ip, &k)?;
+    ip.alloc(2 * OBJ_BYTES)?;
     ip.current_dict()?.put(k, v);
     Ok(())
 }
 
 pub fn load(ip: &mut Interp) -> R {
     let k = ip.pop()?;
+    key_cost(ip, &k)?;
     let Some(v) = ip.lookup(&k.key()) else {
         ip.dollar_error.put_name(b"offending", k);
         return err("undefined");
@@ -672,6 +734,7 @@ pub fn load(ip: &mut Interp) -> R {
 pub fn store(ip: &mut Interp) -> R {
     let v = ip.pop()?;
     let k = ip.pop()?;
+    key_cost(ip, &k)?;
     let key = k.key();
     let d = ip.d.iter().rev().find(|d| d.known(&key)).cloned().map_or_else(|| ip.current_dict(), Ok)?;
     d.put(k, v);
@@ -680,6 +743,7 @@ pub fn store(ip: &mut Interp) -> R {
 
 pub fn get(ip: &mut Interp) -> R {
     let k = ip.pop()?;
+    key_cost(ip, &k)?;
     match ip.pop()? {
         Obj::Dict(d) => {
             let Some(v) = d.get(&k.key()) else {
@@ -714,7 +778,8 @@ pub fn put(ip: &mut Interp) -> R {
     let k = ip.pop()?;
     match ip.pop()? {
         Obj::Dict(d) => {
-            ip.alloc(32)?;
+            key_cost(ip, &k)?;
+            ip.alloc(2 * OBJ_BYTES)?;
             d.put(k, v);
             Ok(())
         }
@@ -733,19 +798,24 @@ pub fn put(ip: &mut Interp) -> R {
 
 pub fn known(ip: &mut Interp) -> R {
     let k = ip.pop()?;
+    key_cost(ip, &k)?;
     let d = ip.pop_dict()?;
     ip.push(Obj::Bool(d.known(&k.key())))
 }
 
 pub fn undef(ip: &mut Interp) -> R {
     let k = ip.pop()?;
+    key_cost(ip, &k)?;
     let d = ip.pop_dict()?;
     d.remove(&k.key());
     Ok(())
 }
 
 pub fn where_(ip: &mut Interp) -> R {
-    let k = ip.pop()?.key();
+    let k = ip.pop()?;
+    key_cost(ip, &k)?;
+    ip.charge(ip.d.len() as u64 / 16)?;
+    let k = k.key();
     match ip.d.iter().rev().find(|d| d.known(&k)).cloned() {
         Some(d) => {
             ip.push(Obj::Dict(d))?;
@@ -784,13 +854,15 @@ pub fn cleardictstack(ip: &mut Interp) -> R {
 
 pub fn array(ip: &mut Interp) -> R {
     let n = ip.pop_usize()?;
-    ip.alloc(n.saturating_mul(16))?;
+    ip.alloc(n.saturating_mul(OBJ_BYTES))?;
+    ip.charge(n as u64)?;
     ip.push(Obj::Array(PArr::new(vec![Obj::Null; n]), false))
 }
 
 pub fn string(ip: &mut Interp) -> R {
     let n = ip.pop_usize()?;
     ip.alloc(n)?;
+    ip.charge_bytes(n)?;
     ip.push(Obj::Str(PStr::new(vec![0; n]), false))
 }
 
@@ -829,12 +901,18 @@ pub fn putinterval(ip: &mut Interp) -> R {
             if start.checked_add(src.len).is_none_or(|e| e > dst.len) {
                 return err("rangecheck");
             }
+            ip.charge(src.len as u64)?;
+            ip.alloc(src.len.saturating_mul(OBJ_BYTES))?;
             for (i, o) in src.items().into_iter().enumerate() {
                 dst.set(start + i, o);
             }
             Ok(())
         }
-        (Obj::Str(dst, _), Obj::Str(src, _)) => dst.put_bytes(start, &src.bytes()).map(|_| ()).ok_or(PsErr::Ps("rangecheck")),
+        (Obj::Str(dst, _), Obj::Str(src, _)) => {
+            ip.charge_bytes(src.len)?;
+            ip.alloc(src.len)?;
+            dst.put_bytes(start, &src.bytes()).map(|_| ()).ok_or(PsErr::Ps("rangecheck"))
+        }
         _ => err("typecheck"),
     }
 }
@@ -842,6 +920,8 @@ pub fn putinterval(ip: &mut Interp) -> R {
 pub fn aload(ip: &mut Interp) -> R {
     let o = ip.pop()?;
     let Obj::Array(a, _) = &o else { return err("typecheck") };
+    ip.charge(a.len as u64)?;
+    ip.alloc(a.len.saturating_mul(OBJ_BYTES))?;
     for v in a.items() {
         ip.push(v)?;
     }
@@ -852,6 +932,7 @@ pub fn astore(ip: &mut Interp) -> R {
     let o = ip.pop()?;
     let Obj::Array(a, _) = &o else { return err("typecheck") };
     ip.need(a.len)?;
+    ip.charge(a.len as u64)?;
     let start = ip.o.len() - a.len;
     let items = ip.o.split_off(start);
     for (i, v) in items.into_iter().enumerate() {
@@ -863,6 +944,8 @@ pub fn astore(ip: &mut Interp) -> R {
 pub fn packedarray(ip: &mut Interp) -> R {
     let n = ip.pop_usize()?;
     ip.need(n)?;
+    ip.charge(n as u64)?;
+    ip.alloc(n.saturating_mul(OBJ_BYTES))?;
     let start = ip.o.len() - n;
     let items = ip.o.split_off(start);
     ip.push(Obj::Array(PArr::new(items), false))
@@ -871,8 +954,10 @@ pub fn packedarray(ip: &mut Interp) -> R {
 pub fn search(ip: &mut Interp) -> R {
     let seek = ip.pop_str()?.bytes();
     let s = ip.pop_str()?;
+    ip.charge_bytes(s.len.saturating_add(seek.len()))?;
+    ip.alloc(s.len.saturating_add(seek.len()))?;
     let hay = s.bytes();
-    let found = if seek.is_empty() { Some(0) } else { hay.windows(seek.len()).position(|w| w == seek.as_slice()) };
+    let found = find(ip, &hay, &seek)?;
     match found {
         Some(i) => {
             let post = s.interval(i + seek.len(), hay.len() - i - seek.len()).ok_or(PsErr::Ps("rangecheck"))?;
@@ -890,9 +975,34 @@ pub fn search(ip: &mut Interp) -> R {
     }
 }
 
+/// Where `seek` first occurs in `hay`, charging the bytes compared as it goes (a naive search
+/// costs |hay| × |seek| on inputs made to defeat it).
+fn find(ip: &mut Interp, hay: &[u8], seek: &[u8]) -> R<Option<usize>> {
+    if seek.is_empty() {
+        return Ok(Some(0));
+    }
+    let mut compared = 0usize;
+    for (i, w) in hay.windows(seek.len()).enumerate() {
+        let same = w.iter().zip(seek).take_while(|(a, b)| a == b).count();
+        compared += same + 1;
+        if same == seek.len() {
+            ip.charge_bytes(compared)?;
+            return Ok(Some(i));
+        }
+        if compared >= 1 << 16 {
+            ip.charge_bytes(compared)?;
+            compared = 0;
+        }
+    }
+    ip.charge_bytes(compared)?;
+    Ok(None)
+}
+
 pub fn anchorsearch(ip: &mut Interp) -> R {
     let seek = ip.pop_str()?.bytes();
     let s = ip.pop_str()?;
+    ip.charge_bytes(s.len.saturating_add(seek.len()))?;
+    ip.alloc(s.len.saturating_add(seek.len()))?;
     if s.bytes().starts_with(&seek) {
         let post = s.interval(seek.len(), s.len - seek.len()).ok_or(PsErr::Ps("rangecheck"))?;
         let m = s.interval(0, seek.len()).ok_or(PsErr::Ps("rangecheck"))?;
@@ -909,9 +1019,9 @@ pub fn anchorsearch(ip: &mut Interp) -> R {
 pub fn token(ip: &mut Interp) -> R {
     match ip.pop()? {
         Obj::Str(s, _) => {
-            let bytes = s.bytes();
-            let id = ip.srcs.add(crate::source::Source::bytes(bytes));
-            let d = ip.d.clone();
+            ip.alloc(crate::interp::SOURCE_BYTES)?;
+            let id = ip.srcs.add(crate::source::Source::string(&s));
+            let d = &ip.d;
             let mut resolve = |n: &[u8]| d.iter().rev().find_map(|dict| dict.get(&Key::Name(name(n))));
             match crate::scan::next(&mut ip.srcs, id, &mut resolve) {
                 Ok(Some(o)) => {
@@ -926,7 +1036,7 @@ pub fn token(ip: &mut Interp) -> R {
             }
         }
         Obj::File(id) => {
-            let d = ip.d.clone();
+            let d = &ip.d;
             let mut resolve = |n: &[u8]| d.iter().rev().find_map(|dict| dict.get(&Key::Name(name(n))));
             match crate::scan::next(&mut ip.srcs, id, &mut resolve) {
                 Ok(Some(o)) => {
@@ -947,13 +1057,13 @@ pub fn bind(ip: &mut Interp) -> R {
     let o = ip.top(0)?.clone();
     let Obj::Array(root, _) = o else { return Ok(()) };
     let mut todo = vec![root];
-    let mut seen: Vec<usize> = Vec::new();
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     while let Some(a) = todo.pop() {
         let id = std::rc::Rc::as_ptr(&a.buf) as *const u8 as usize;
-        if seen.contains(&id) || seen.len() > 100_000 {
+        if seen.len() > 100_000 || !seen.insert(id) {
             continue;
         }
-        seen.push(id);
+        ip.charge(a.len as u64)?;
         for i in 0..a.len {
             match a.get(i) {
                 Some(Obj::Name(n, true)) => {

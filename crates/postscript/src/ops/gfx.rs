@@ -55,6 +55,7 @@ pub fn restore(ip: &mut Interp) -> R {
 }
 
 pub fn gstate(ip: &mut Interp) -> R {
+    ip.charge_gstate()?;
     if ip.gstates.len() > 100_000 {
         return err("limitcheck");
     }
@@ -64,6 +65,7 @@ pub fn gstate(ip: &mut Interp) -> R {
 }
 
 pub fn currentgstate(ip: &mut Interp) -> R {
+    ip.charge_gstate()?;
     let Obj::GState(n) = ip.pop()? else { return err("typecheck") };
     if let Some(slot) = ip.gstates.get_mut(n) {
         *slot = ip.gs.clone();
@@ -72,6 +74,7 @@ pub fn currentgstate(ip: &mut Interp) -> R {
 }
 
 pub fn setgstate(ip: &mut Interp) -> R {
+    ip.charge_gstate()?;
     let Obj::GState(n) = ip.pop()? else { return err("typecheck") };
     if let Some(g) = ip.gstates.get(n) {
         ip.gs = g.clone();
@@ -530,12 +533,18 @@ pub fn currentpoint(ip: &mut Interp) -> R {
 }
 
 pub fn flattenpath(ip: &mut Interp) -> R {
+    ip.charge_path(ip.gs.path.len().saturating_mul(16))?;
     let tol = ip.gs.flat;
-    ip.gs.path = flatten(&ip.gs.path, tol);
+    let flat = flatten(&ip.gs.path, tol);
+    if flat.len() > MAX_PATH {
+        return err("limitcheck");
+    }
+    ip.gs.path = flat;
     Ok(())
 }
 
 pub fn reversepath(ip: &mut Interp) -> R {
+    ip.charge_path(ip.gs.path.len())?;
     // Reverse each subpath.
     let mut out = Vec::with_capacity(ip.gs.path.len());
     let mut sub: Vec<Seg> = Vec::new();
@@ -578,6 +587,7 @@ pub fn reversepath(ip: &mut Interp) -> R {
 /// `strokepath`: the outline of what `stroke` would paint, as the current path. The pen is
 /// shaped in user space (width, caps, joins, miter limit, dashes), as for `stroke`.
 pub fn strokepath(ip: &mut Interp) -> R {
+    ip.charge_path(ip.gs.path.len().saturating_mul(4))?;
     use kurbo::{Cap, Join, PathEl, Point, Stroke, StrokeOpts};
     let ctm = ip.gs.ctm;
     let Some(inv) = ctm.inv() else {
@@ -661,6 +671,7 @@ pub fn strokepath(ip: &mut Interp) -> R {
 }
 
 pub fn pathbbox(ip: &mut Interp) -> R {
+    ip.charge(ip.gs.path.len() as u64 / 4 + 1)?;
     let b = bbox(&ip.gs.path).ok_or(PsErr::Ps("nocurrentpoint"))?;
     let inv = ip.gs.ctm.inv().ok_or(PsErr::Ps("undefinedresult"))?;
     let corners = [inv.apply(b[0], b[1]), inv.apply(b[2], b[1]), inv.apply(b[0], b[3]), inv.apply(b[2], b[3])];
@@ -678,6 +689,7 @@ pub fn pathbbox(ip: &mut Interp) -> R {
 }
 
 pub fn pathforall(ip: &mut Interp) -> R {
+    ip.charge_path(ip.gs.path.len())?;
     let close = ip.pop()?;
     let curve = ip.pop()?;
     let line = ip.pop()?;
@@ -703,6 +715,7 @@ pub fn rect_path(ip: &mut Interp) -> R<Vec<Seg>> {
     let mut rects: Vec<[f64; 4]> = Vec::new();
     match ip.pop()? {
         Obj::Array(a, _) => {
+            ip.charge_path(a.len)?;
             let v: Vec<f64> = a.items().iter().filter_map(Obj::num).collect();
             for r in v.as_chunks::<4>().0 {
                 rects.push(*r);
@@ -730,6 +743,7 @@ pub fn rect_path(ip: &mut Interp) -> R<Vec<Seg>> {
 // ----- painting -----
 
 pub fn fill_path(ip: &mut Interp, path: &[Seg], eo: bool) -> R {
+    ip.charge(path.len() as u64 / 4 + 1)?;
     if ip.gs.nulldev {
         return Ok(());
     }
@@ -753,6 +767,7 @@ pub fn eofill(ip: &mut Interp) -> R {
 }
 
 pub fn stroke_path(ip: &mut Interp, path: &[Seg]) -> R {
+    ip.charge_path(path.len())?;
     if ip.gs.nulldev {
         return Ok(());
     }
@@ -802,11 +817,13 @@ fn clip_with(ip: &mut Interp, path: Vec<Seg>, eo: bool) -> R {
 }
 
 pub fn clip(ip: &mut Interp) -> R {
+    ip.charge_path(ip.gs.path.len())?;
     let path = ip.gs.path.clone();
     clip_with(ip, path, false)
 }
 
 pub fn eoclip(ip: &mut Interp) -> R {
+    ip.charge_path(ip.gs.path.len())?;
     let path = ip.gs.path.clone();
     clip_with(ip, path, true)
 }
@@ -839,6 +856,8 @@ pub fn initclip(ip: &mut Interp) -> R {
 }
 
 pub fn clippath(ip: &mut Interp) -> R {
+    let n = ip.gs.clip.as_ref().map_or(0, |c| c.path.len());
+    ip.charge_path(n)?;
     let path = match &ip.gs.clip {
         Some(c) => c.path.clone(),
         None => {

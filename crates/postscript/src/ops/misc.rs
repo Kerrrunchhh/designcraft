@@ -579,7 +579,10 @@ pub fn resourceforall(ip: &mut Interp) -> R {
     let scratch = ip.pop_str()?;
     let proc = ip.pop()?;
     let _template = ip.pop()?;
-    for (k, _) in category(ip, &cat).entries() {
+    let entries = category(ip, &cat).entries();
+    ip.charge(entries.len() as u64)?;
+    ip.alloc(entries.len().saturating_mul(2 * crate::ops::basic::OBJ_BYTES))?;
+    for (k, _) in entries {
         let t = crate::ops::basic::text_of(&k);
         if let Some(w) = scratch.put_bytes(0, &t) {
             ip.push(Obj::Str(w, false))?;
@@ -701,6 +704,8 @@ pub fn defineuserobject(ip: &mut Interp) -> R {
             if i >= 100_000 {
                 return err("limitcheck");
             }
+            ip.charge((i + 1) as u64)?;
+            ip.alloc((i + 1).saturating_mul(crate::ops::basic::OBJ_BYTES))?;
             items.resize(i + 1, Obj::Null);
             let a = PArr::new(items);
             ip.userdict.put_name(b"UserObjects", Obj::Array(a.clone(), false));

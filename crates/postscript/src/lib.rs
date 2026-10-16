@@ -37,6 +37,9 @@ pub struct Converted {
     pub bbox: [f64; 4],
     /// Things the program did that weren't drawn (unsupported features).
     pub warnings: Vec<String>,
+    /// The work and memory the conversion used, as [`Limits`] counts them.
+    pub steps: u64,
+    pub memory: usize,
 }
 
 fn u32le(b: &[u8], at: usize) -> Option<usize> {
@@ -123,7 +126,8 @@ pub fn eps_to_pdf(bytes: &[u8], limits: Limits) -> Result<Converted, String> {
         warnings.push(e);
     }
     let size = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
-    Ok(Converted { pdf: ip.out.finish(size), bbox, warnings })
+    let (steps, memory) = (ip.steps, ip.memory);
+    Ok(Converted { pdf: ip.out.finish(size), bbox, warnings, steps, memory })
 }
 
 #[cfg(test)]

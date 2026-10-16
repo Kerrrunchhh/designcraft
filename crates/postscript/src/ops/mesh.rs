@@ -123,6 +123,7 @@ pub fn build(ip: &mut Interp, d: &PDict, kind: i64, space: &Space, func: Option<
             let per_row = num(b"VerticesPerRow").max(2.0) as usize;
             let mut pending: Vec<usize> = Vec::new();
             while verts.len() < MAX_ELEMENTS {
+                ip.charge(1)?;
                 let flag = if kind == 4 {
                     match r.flag() {
                         Some(f) => f,
@@ -184,6 +185,7 @@ pub fn build(ip: &mut Interp, d: &PDict, kind: i64, space: &Space, func: Option<
                 if count >= MAX_ELEMENTS {
                     break;
                 }
+                ip.charge(4)?;
                 let Some(flag) = r.flag() else { break };
                 let (shared_pts, shared_cols) = match (flag, &prev) {
                     (1..=3, Some((pp, pc))) => {

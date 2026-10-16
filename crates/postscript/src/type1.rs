@@ -8,6 +8,8 @@ use crate::obj::{Key, Obj, PDict, name};
 pub struct Glyph {
     pub path: Vec<Seg>,
     pub width: (f64, f64),
+    /// The work making it took (charstring operators run, or outline points).
+    pub cost: usize,
 }
 
 /// The most charstring operators run for one glyph (subroutines included).
@@ -296,7 +298,7 @@ pub fn glyph(font: &PDict, glyph: &[u8], std_names: &[&str]) -> Option<Glyph> {
     let std_glyph = |i: usize| std_names.get(i).map(|n| n.as_bytes().to_vec());
     exec(&f, &code, &mut run, 0, &std_glyph)?;
     run.close();
-    Some(Glyph { path: run.path, width: run.width })
+    Some(Glyph { cost: run.ops + run.path.len(), path: run.path, width: run.width })
 }
 
 #[cfg(test)]

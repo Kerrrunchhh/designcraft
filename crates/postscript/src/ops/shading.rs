@@ -11,6 +11,8 @@ use crate::pdf::{OutSpace, ShadeKind, Shading};
 /// Samples along an axial or radial shading, and per side of a function-based one.
 const SAMPLES: usize = 256;
 const GRID: usize = 48;
+/// The most inputs a sampled function may take.
+const MAX_INPUTS: usize = 4;
 /// The most samples a sampled function may hold.
 const MAX_SAMPLES: usize = 1 << 22;
 
@@ -87,9 +89,12 @@ fn parse_fn(ip: &mut Interp, o: &Obj, depth: usize) -> R<Func> {
             let outs = range.len() / 2;
             let bps = d.get_name(b"BitsPerSample").and_then(|o| o.num()).unwrap_or(8.0) as usize;
             let count = size.iter().try_fold(outs.max(1), |a, s| a.checked_mul(*s)).filter(|n| *n <= MAX_SAMPLES).ok_or(PsErr::Ps("limitcheck"))?;
-            if size.is_empty() || outs == 0 || !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+            // At most four inputs: interpolation visits 2^inputs corners per value.
+            if size.is_empty() || size.len() > MAX_INPUTS || outs == 0 || !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
                 return err("rangecheck");
             }
+            ip.charge(count as u64)?;
+            ip.alloc(count.saturating_mul(8))?;
             let bytes_needed = (count * bps).div_ceil(8);
             let data = match d.get_name(b"DataSource") {
                 Some(Obj::Str(s, _)) => s.bytes(),

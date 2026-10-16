@@ -41,6 +41,11 @@ fn item_json(it: &Item) -> Value {
         Content::Text(t) => {
             v["story"] = json!(t.story.0);
             v["columns"] = json!(t.options.columns);
+            v["columnsKind"] = json!(t.options.columns_kind);
+            v["gutter"] = json!(t.options.gutter);
+            if t.options.columns_kind != designcraft_doc::ColumnsKind::FixedNumber {
+                v["columnWidth"] = json!(t.options.column_width);
+            }
             v["columnRule"] = json!(t.options.column_rule);
             if t.options.column_rule {
                 v["columnRuleWeight"] = json!(t.options.column_rule_weight);

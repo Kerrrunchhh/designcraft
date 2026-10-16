@@ -561,7 +561,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Text Frame Options…",
             ["Object"],
             Some("Cmd+B"),
-            "{columns?, gutter?, inset?: number|[t,l,b,r] (null keeps that side), verticalJustification?: top|center|bottom|justify, firstBaseline?: ascent|capHeight|leading|xHeight|emboxHeight|fixed, autoSize?, ignoreWrap?, balanceColumns?, columnRule?: bool, columnRuleWeight? (pt), columnRuleColor? (swatch name), columnRuleTint? (0..1), columnRuleOffset? (pt, horizontal), columnRuleTopInset? (pt), columnRuleBottomInset? (pt), vertical?: bool (sets the story direction of the frames' stories, as Type ▸ Story Direction), ids?}",
+            "{columns?, gutter?, columnsKind?: fixedNumber|fixedWidth|flexibleWidth, columnWidth? (pt, for fixed and flexible width), inset?: number|[t,l,b,r] (null keeps that side), verticalJustification?: top|center|bottom|justify, firstBaseline?: ascent|capHeight|leading|xHeight|emboxHeight|fixed, autoSize?, ignoreWrap?, balanceColumns?, columnRule?: bool, columnRuleWeight? (pt), columnRuleColor? (swatch name), columnRuleTint? (0..1), columnRuleOffset? (pt, horizontal), columnRuleTopInset? (pt), columnRuleBottomInset? (pt), vertical?: bool (sets the story direction of the frames' stories, as Type ▸ Story Direction), ids?}",
             has_selection,
             text_frame_options
         ),
@@ -1688,6 +1688,7 @@ fn text_frame_options(s: &mut Session, p: &Value) -> Result<Value> {
             _ => Err(bad(ID, format!("{key} must be {what} from {lo} to {hi}, not {v}"))),
         },
     };
+    let column_width = ranged("columnWidth", 1.0, 100_000.0, "a number of points")?;
     let rule_weight = ranged("columnRuleWeight", 0.0, 1000.0, "a number of points")?;
     let rule_tint = ranged("columnRuleTint", 0.0, 1.0, "a tint")?;
     let rule_offset = ranged("columnRuleOffset", -1440.0, 1440.0, "a number of points")?;
@@ -1708,6 +1709,9 @@ fn text_frame_options(s: &mut Session, p: &Value) -> Result<Value> {
             }
             if let Some(v) = p.get("gutter").and_then(Value::as_f64) {
                 o.gutter = v.max(0.0);
+            }
+            if let Some(w) = column_width {
+                o.column_width = w;
             }
             match p.get("inset") {
                 Some(Value::Number(n)) => o.inset = [n.as_f64().unwrap_or(0.0); 4],
@@ -3491,5 +3495,31 @@ mod fill_tint_tests {
         let stroke_of = |s: &Session, id: u64| s.doc().unwrap().doc.item(ItemId(id)).unwrap().stroke.clone();
         assert_eq!((stroke_of(&s, a).swatch.as_str(), stroke_of(&s, a).tint, stroke_of(&s, a).weight), ("C=100 M=0 Y=0 K=0", 0.5, 2.0));
         assert!(stroke_of(&s, b).is_none());
+    }
+}
+
+#[cfg(test)]
+mod column_width_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn fixed_column_width_is_set_composed_and_reported() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [72, 72, 472, 272], "content": "text", "text": "word ".repeat(200)})).unwrap();
+        let (frame, story) = (r["id"].as_u64().unwrap(), designcraft_doc::StoryId(r["story"].as_u64().unwrap()));
+        s.execute("object.textFrameOptions", &json!({"columns": 2, "gutter": 12, "columnsKind": "fixedWidth", "columnWidth": 100, "ids": [frame]}))
+            .unwrap();
+        let d = s.doc().unwrap().doc.clone();
+        let cs = s.cache.get(&d, story, None);
+        let widths: Vec<f64> = cs.frames[0].columns.iter().map(|c| c.width()).collect();
+        assert_eq!(widths, [100.0, 100.0], "two fixed 100 pt columns");
+        let inspected = s.execute("document.inspect", &json!({})).unwrap().to_string();
+        assert!(inspected.contains("\"columnsKind\":\"fixedWidth\"") && inspected.contains("\"columnWidth\":100.0"), "{inspected}");
+        for bad in [json!(0), json!(-5), json!("wide"), json!(1e9)] {
+            assert!(s.execute("object.textFrameOptions", &json!({"columnWidth": bad, "ids": [frame]})).is_err(), "{bad}");
+        }
     }
 }

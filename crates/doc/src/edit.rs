@@ -130,6 +130,11 @@ impl Document {
         Some(it)
     }
 
+    /// The anchored object `id` is (or is inside, in a group): its story and its index there.
+    pub fn anchored_of(&self, id: ItemId) -> Option<(StoryId, usize)> {
+        self.find_anchored(id).map(|(s, i, _)| (s, i))
+    }
+
     /// Where an anchored item is: its story, its anchored object, and the path through groups
     /// inside that object.
     fn find_anchored(&self, id: ItemId) -> Option<(StoryId, usize, Vec<usize>)> {

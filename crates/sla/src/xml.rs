@@ -5,6 +5,11 @@ use quick_xml::events::Event;
 
 /// Deeper nesting is refused (groups in groups, …) so a hostile file can't exhaust the stack.
 pub const MAX_DEPTH: usize = 256;
+/// Most memory the parsed tree may take (estimated: its strings plus a fixed cost per element
+/// and attribute), so a small file of many tiny elements can't exhaust memory either.
+pub const MAX_TREE_BYTES: usize = 1 << 30;
+const ELEMENT_COST: usize = std::mem::size_of::<El>();
+const ATTRIBUTE_COST: usize = 2 * std::mem::size_of::<String>();
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct El {
@@ -44,6 +49,18 @@ impl El {
 
 /// Parse `bytes` into the document's root element.
 pub fn parse(bytes: &[u8]) -> Result<El, String> {
+    parse_within(bytes, MAX_TREE_BYTES)
+}
+
+fn parse_within(bytes: &[u8], budget: usize) -> Result<El, String> {
+    let mut left = budget;
+    let mut charge = |el: &El| -> Result<(), String> {
+        let cost = el.attrs.iter().fold(ELEMENT_COST.saturating_add(el.name.len()), |n, (k, v)| {
+            n.saturating_add(ATTRIBUTE_COST).saturating_add(k.len()).saturating_add(v.len())
+        });
+        left = left.checked_sub(cost).ok_or_else(|| format!("the document needs more than {} MB of memory to read", budget >> 20))?;
+        Ok(())
+    };
     let mut r = quick_xml::Reader::from_reader(bytes);
     r.config_mut().trim_text(true);
     let mut stack: Vec<El> = vec![El::default()];
@@ -55,10 +72,13 @@ pub fn parse(bytes: &[u8]) -> Result<El, String> {
                 if stack.len() > MAX_DEPTH {
                     return Err(format!("XML elements nested deeper than {MAX_DEPTH} levels"));
                 }
-                stack.push(start_el(&e)?);
+                let el = start_el(&e)?;
+                charge(&el)?;
+                stack.push(el);
             }
             Event::Empty(e) => {
                 let el = start_el(&e)?;
+                charge(&el)?;
                 stack.last_mut().ok_or("unbalanced XML")?.children.push(el);
             }
             Event::End(_) => {
@@ -107,6 +127,14 @@ mod tests {
     fn nesting_past_the_budget_is_refused() {
         let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH + 2), "</a>".repeat(MAX_DEPTH + 2));
         assert!(parse(deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn trees_past_the_memory_budget_are_refused() {
+        let flat = format!("<a>{}</a>", "<b x=\"1\"/>".repeat(1000));
+        assert!(parse_within(flat.as_bytes(), 1 << 20).is_ok());
+        let err = parse_within(flat.as_bytes(), 1000 * ELEMENT_COST).unwrap_err();
+        assert!(err.contains("memory"), "{err}");
     }
 
     #[test]

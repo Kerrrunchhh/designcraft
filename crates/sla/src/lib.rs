@@ -51,6 +51,10 @@ pub enum SlaError {
 
 pub type Result<T> = std::result::Result<T, SlaError>;
 
+/// Largest `.sla` file imported (the largest seen in practice is a few MB; images are usually
+/// linked, not embedded).
+pub const MAX_BYTES: usize = 256 << 20;
+
 /// The file extension Scribus documents use.
 pub const EXTENSION: &str = "sla";
 

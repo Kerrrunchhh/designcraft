@@ -22,10 +22,17 @@ pub(crate) fn is_sla(bytes: &[u8]) -> bool {
 pub(crate) fn open_sla(s: &mut Session, p: &Value) -> Result<Value> {
     let (bytes, file, title) = if let Some(b) = str_param(p, "base64") {
         let name = str_param(p, "name").unwrap_or_default();
+        if b.len() / 4 * 3 > designcraft_sla::MAX_BYTES + 3 {
+            return Err(too_large());
+        }
         (base64_decode(b), None, without_sla_extension(name).to_string())
     } else if let Some(path) = str_param(p, "path") {
         #[cfg(not(target_arch = "wasm32"))]
-        let b = crate::io::read_file(path).map_err(EngineError::Other)?;
+        let b = crate::io::read_capped(path, designcraft_sla::MAX_BYTES as u64).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if b.len() > designcraft_sla::MAX_BYTES {
+            return Err(too_large());
+        }
         #[cfg(target_arch = "wasm32")]
         let b: Vec<u8> = Vec::new();
         let pp = std::path::Path::new(path);
@@ -70,6 +77,10 @@ pub(crate) fn open_sla(s: &mut Session, p: &Value) -> Result<Value> {
     st.fonts = fonts;
     let i = s.add_document(st);
     Ok(json!({"index": i, "documentFonts": faces, "warnings": warnings}))
+}
+
+fn too_large() -> EngineError {
+    EngineError::Other(format!("the Scribus document is larger than {} MB", designcraft_sla::MAX_BYTES >> 20))
 }
 
 /// Bytes no placeable format starts with (`read_packaged_link` read every file that is one).

@@ -35,6 +35,9 @@ pub fn import_sla_report(bytes: &[u8], read_link: &dyn Fn(&str) -> Option<Vec<u8
     if !crate::is_sla(bytes) {
         return Err(SlaError::NotSla("the file doesn't start with a Scribus document element".into()));
     }
+    if bytes.len() > crate::MAX_BYTES {
+        return Err(SlaError::Invalid(format!("the file is larger than {} MB", crate::MAX_BYTES >> 20)));
+    }
     let root = xml::parse(bytes).map_err(SlaError::Invalid)?;
     let doc = root.find(&["DOCUMENT", "Document"]).ok_or_else(|| SlaError::Invalid("no DOCUMENT element".into()))?;
     let mut im = Importer::new(read_link, has_family);
@@ -52,6 +55,8 @@ const MAX_GROUP_DEPTH: usize = 64;
 /// inflate a thousandfold.
 const MAX_EMBEDDED_IMAGE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_EMBEDDED: u64 = 1024 * 1024 * 1024;
+/// Most bytes all linked images may hold together: what a `.designcraft` file can store.
+const MAX_TOTAL_LINKED: u64 = 4 << 30;
 
 const PAGE_OBJECTS: &[&str] = &["PAGEOBJECT", "PageObject"];
 const MASTER_OBJECTS: &[&str] = &["MASTEROBJECT", "MasterObject"];
@@ -243,6 +248,8 @@ struct Importer<'a> {
     items: usize,
     /// Bytes of embedded images inflated so far (see [`MAX_TOTAL_EMBEDDED`]).
     embedded_bytes: u64,
+    /// Bytes of linked images read so far (see [`MAX_TOTAL_LINKED`]).
+    linked_bytes: u64,
 }
 
 impl<'a> Importer<'a> {
@@ -275,6 +282,7 @@ impl<'a> Importer<'a> {
             skipped: BTreeMap::new(),
             items: 0,
             embedded_bytes: 0,
+            linked_bytes: 0,
         }
     }
 
@@ -933,6 +941,14 @@ impl<'a> Importer<'a> {
                             }
                             data
                         };
+                    // Past the total the image stays linked, without its data, to be relinked.
+                    let data = if data.len() as u64 > MAX_TOTAL_LINKED.saturating_sub(self.linked_bytes) {
+                        *self.skipped.entry("linked images past the 4 GB total (left unloaded)").or_default() += 1;
+                        Vec::new()
+                    } else {
+                        self.linked_bytes = self.linked_bytes.saturating_add(data.len() as u64);
+                        data
+                    };
                     let hit = self.add_asset(data, path, Some(path.clone()), fallback);
                     self.linked.insert(path.clone(), hit);
                     hit
@@ -1156,6 +1172,34 @@ mod unit_tests {
         assert_eq!(inflate_embedded(&b64, 4096).map(|b| b.len()), Some(4096));
         assert_eq!(inflate_embedded(&b64, 4095), None, "past the remaining budget");
         assert_eq!(inflate_embedded(&b64, 0), None);
+    }
+
+    #[test]
+    fn linked_images_stop_at_the_total() {
+        let mut sla = String::from(r#"<SCRIBUSUTF8NEW Version="1.7"><Document><Page PageWidth="10" PageHeight="10"/>"#);
+        for i in 0..3 {
+            sla.push_str(&format!(r#"<PageObject ItemType="2" Width="5" Height="5" ImageFileName="{i}.svg"/>"#));
+        }
+        sla.push_str("</Document></SCRIBUSUTF8NEW>");
+        let read = |_: &str| Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#.to_vec());
+        let mut im = Importer::new(&read, &|_| false);
+        // Room for one image only.
+        im.linked_bytes = MAX_TOTAL_LINKED - 70;
+        let root = crate::xml::parse(sla.as_bytes()).unwrap();
+        let doc = root.find(&["Document"]).unwrap();
+        im.run(doc).unwrap();
+        let out = im.finish(doc).unwrap();
+        let loaded = out.document.assets.values().filter(|a| !a.data.is_empty()).count();
+        assert_eq!((loaded, out.document.assets.len()), (1, 3), "the others stay linked");
+        assert!(out.warnings.iter().any(|w| w.contains("2 linked images past the 4 GB total")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn oversized_files_are_refused() {
+        let mut big = br#"<SCRIBUSUTF8NEW Version="1.7">"#.to_vec();
+        big.resize(crate::MAX_BYTES + 1, b' ');
+        let err = import_sla(&big, &|_| None).map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
     }
 
     #[test]

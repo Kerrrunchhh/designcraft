@@ -930,17 +930,21 @@ impl<'a> Importer<'a> {
                 if let Some(hit) = self.linked.get(path) {
                     *hit
                 } else {
-                    let data = (self.read_link)(path).unwrap_or_default();
-                    let data =
-                        if !data.is_empty() && designcraft_images::mime(&data) == "application/octet-stream" && !designcraft_images::is_eps(&data) {
-                            self.unsupported_links.insert(path.clone());
-                            Vec::new()
-                        } else {
-                            if data.is_empty() {
-                                self.missing_links.insert(path.clone());
-                            }
-                            data
-                        };
+                    // Once the total is used up, the files aren't read at all.
+                    let data = if self.linked_bytes >= MAX_TOTAL_LINKED { Vec::new() } else { (self.read_link)(path).unwrap_or_default() };
+                    let data = if self.linked_bytes >= MAX_TOTAL_LINKED {
+                        *self.skipped.entry("linked images past the 4 GB total (left unloaded)").or_default() += 1;
+                        data
+                    } else if !data.is_empty() && designcraft_images::mime(&data) == "application/octet-stream" && !designcraft_images::is_eps(&data)
+                    {
+                        self.unsupported_links.insert(path.clone());
+                        Vec::new()
+                    } else {
+                        if data.is_empty() {
+                            self.missing_links.insert(path.clone());
+                        }
+                        data
+                    };
                     // Past the total the image stays linked, without its data, to be relinked.
                     let data = if data.len() as u64 > MAX_TOTAL_LINKED.saturating_sub(self.linked_bytes) {
                         *self.skipped.entry("linked images past the 4 GB total (left unloaded)").or_default() += 1;
@@ -1181,17 +1185,30 @@ mod unit_tests {
             sla.push_str(&format!(r#"<PageObject ItemType="2" Width="5" Height="5" ImageFileName="{i}.svg"/>"#));
         }
         sla.push_str("</Document></SCRIBUSUTF8NEW>");
-        let read = |_: &str| Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#.to_vec());
-        let mut im = Importer::new(&read, &|_| false);
-        // Room for one image only.
-        im.linked_bytes = MAX_TOTAL_LINKED - 70;
-        let root = crate::xml::parse(sla.as_bytes()).unwrap();
-        let doc = root.find(&["Document"]).unwrap();
-        im.run(doc).unwrap();
-        let out = im.finish(doc).unwrap();
-        let loaded = out.document.assets.values().filter(|a| !a.data.is_empty()).count();
-        assert_eq!((loaded, out.document.assets.len()), (1, 3), "the others stay linked");
-        assert!(out.warnings.iter().any(|w| w.contains("2 linked images past the 4 GB total")), "{:?}", out.warnings);
+        // Three images of 63 bytes with `used` bytes of the total taken → (images loaded, files read, warnings).
+        let run = |used: u64| {
+            let reads = std::cell::Cell::new(0);
+            let read = |_: &str| {
+                reads.set(reads.get() + 1);
+                Some(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#.to_vec())
+            };
+            let mut im = Importer::new(&read, &|_| false);
+            im.linked_bytes = used;
+            let root = crate::xml::parse(sla.as_bytes()).unwrap();
+            let doc = root.find(&["Document"]).unwrap();
+            im.run(doc).unwrap();
+            let out = im.finish(doc).unwrap();
+            assert_eq!(out.document.assets.len(), 3, "every image stays linked");
+            (out.document.assets.values().filter(|a| !a.data.is_empty()).count(), reads.get(), out.warnings)
+        };
+        // Room for one.
+        let (loaded, _, warnings) = run(MAX_TOTAL_LINKED - 70);
+        assert_eq!(loaded, 1);
+        assert!(warnings.iter().any(|w| w.contains("2 linked images past the 4 GB total")), "{warnings:?}");
+        // None left: no file is even read.
+        let (loaded, reads, warnings) = run(MAX_TOTAL_LINKED);
+        assert_eq!((loaded, reads), (0, 0));
+        assert!(warnings.iter().any(|w| w.contains("3 linked images past the 4 GB total")), "{warnings:?}");
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub(crate) fn is_sla(bytes: &[u8]) -> bool {
 pub(crate) fn open_sla(s: &mut Session, p: &Value) -> Result<Value> {
     let (bytes, file, title) = if let Some(b) = str_param(p, "base64") {
         let name = str_param(p, "name").unwrap_or_default();
-        if b.len() / 4 * 3 > designcraft_sla::MAX_BYTES + 3 {
+        if base64_decoded_len(b) > designcraft_sla::MAX_BYTES {
             return Err(too_large());
         }
         (base64_decode(b), None, without_sla_extension(name).to_string())
@@ -77,6 +77,13 @@ pub(crate) fn open_sla(s: &mut Session, p: &Value) -> Result<Value> {
     st.fonts = fonts;
     let i = s.add_document(st);
     Ok(json!({"index": i, "documentFonts": faces, "warnings": warnings}))
+}
+
+/// The size base64 `b64` decodes to, counting only the characters the decoder reads (it skips
+/// line breaks and other whitespace).
+fn base64_decoded_len(b64: &str) -> usize {
+    let digits = b64.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').count();
+    digits / 4 * 3 + (digits % 4).saturating_sub(1)
 }
 
 fn too_large() -> EngineError {
@@ -134,6 +141,16 @@ mod tests {
         assert_eq!(s.doc().unwrap().doc.title, "Flyer");
         let err = s.execute("file.openScribus", &json!({"base64": super::super::file::base64_encode(b"<html/>")})).unwrap_err();
         assert!(err.to_string().contains("not a Scribus document"), "{err}");
+    }
+
+    #[test]
+    fn base64_size_ignores_line_breaks_and_padding() {
+        let encoded = super::super::file::base64_encode(&[7u8; 1000]);
+        let wrapped: String = encoded.as_bytes().chunks(76).map(|l| format!("{}\r\n", String::from_utf8_lossy(l))).collect();
+        assert_eq!((base64_decoded_len(&encoded), base64_decoded_len(&wrapped)), (1000, 1000));
+        for n in 0..6 {
+            assert_eq!(base64_decoded_len(&super::super::file::base64_encode(&vec![1u8; n])), n);
+        }
     }
 
     #[test]

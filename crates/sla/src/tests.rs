@@ -23,6 +23,18 @@ fn spread_bounds(item: &Item) -> Rect {
     item.xf.transform_rect_bbox(designcraft_geom::Shape::bounding_box(&item.path.to_bezpath()))
 }
 
+/// Standard base64 with padding.
+pub(crate) fn base64(bytes: &[u8]) -> String {
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    bytes
+        .chunks(3)
+        .flat_map(|c| {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+            (0..4).map(move |i| if i <= c.len() { B64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' })
+        })
+        .collect()
+}
+
 fn near(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
@@ -342,14 +354,7 @@ fn embedded_images_are_inflated() {
     z.write_all(svg).unwrap();
     let mut q = (svg.len() as u32).to_be_bytes().to_vec();
     q.extend(z.finish().unwrap());
-    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let b64: String = q
-        .chunks(3)
-        .flat_map(|c| {
-            let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
-            (0..4).map(move |i| if i <= c.len() { B64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' })
-        })
-        .collect();
+    let b64 = base64(&q);
     let sla = DOC_15.replace(r#"PFILE="pic.png""#, &format!(r#"ImageData="{b64}" inlineImageExt="svg""#));
     let d = import(&sla).document;
     let Content::Graphic(g) = &d.spreads[0].items[1].content else { panic!("not an image") };

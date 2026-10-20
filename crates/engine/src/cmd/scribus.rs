@@ -38,9 +38,10 @@ pub(crate) fn open_sla(s: &mut Session, p: &Value) -> Result<Value> {
         {
             super::interchange::read_packaged_link(link, file.as_deref()).map(|(_, data)| data).or_else(|| {
                 // A file that is there but holds no format DesignCraft places (GIMP's .xcf): its
-                // first bytes let the import say so instead of calling it missing.
+                // first bytes let the import say so instead of calling it missing. A graphic
+                // refused for its size is never handed over cut short.
                 let path = super::interchange::find_packaged_file(link, file.as_deref())?;
-                crate::io::read_capped(&path, 64).ok().filter(|b| !b.is_empty())
+                crate::io::read_capped(&path, 64).ok().filter(|b| is_unplaceable(b))
             })
         }
         #[cfg(target_arch = "wasm32")]
@@ -69,6 +70,11 @@ pub(crate) fn open_sla(s: &mut Session, p: &Value) -> Result<Value> {
     st.fonts = fonts;
     let i = s.add_document(st);
     Ok(json!({"index": i, "documentFonts": faces, "warnings": warnings}))
+}
+
+/// Bytes no placeable format starts with (`read_packaged_link` read every file that is one).
+fn is_unplaceable(head: &[u8]) -> bool {
+    !head.is_empty() && designcraft_images::mime(head) == "application/octet-stream" && !designcraft_images::is_eps(head)
 }
 
 /// `name` without a trailing .sla (any case).
@@ -117,6 +123,28 @@ mod tests {
         assert_eq!(s.doc().unwrap().doc.title, "Flyer");
         let err = s.execute("file.openScribus", &json!({"base64": super::super::file::base64_encode(b"<html/>")})).unwrap_err();
         assert!(err.to_string().contains("not a Scribus document"), "{err}");
+    }
+
+    #[test]
+    fn only_unplaceable_files_are_probed() {
+        assert!(is_unplaceable(b"gimp xcf v011\0\0\0\x10"));
+        // The start of a graphic too large to read is not a stand-in for it.
+        assert!(!is_unplaceable(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"));
+        assert!(!is_unplaceable(b"%!PS-Adobe-3.0 EPSF-3.0"));
+        assert!(!is_unplaceable(b""));
+    }
+
+    #[test]
+    fn unplaceable_linked_files_are_reported_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("missing.png"), b"gimp xcf v011 not an image").unwrap();
+        let path = dir.path().join("Flyer.sla");
+        std::fs::write(&path, SLA).unwrap();
+        let mut s = Session::new();
+        let r = s.execute("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+        let warnings: Vec<&str> = r["warnings"].as_array().unwrap().iter().filter_map(|w| w.as_str()).collect();
+        assert!(warnings.iter().any(|w| w.contains("can't place") && w.contains("missing.png")), "{warnings:?}");
+        assert!(s.doc().unwrap().doc.assets.values().all(|a| a.data.is_empty()), "no partial data is kept");
     }
 
     #[test]

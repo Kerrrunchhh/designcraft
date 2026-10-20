@@ -48,8 +48,10 @@ const MAX_PAGES: usize = 10_000;
 const MAX_ITEMS: usize = 500_000;
 const MAX_SWATCHES: usize = 10_000;
 const MAX_GROUP_DEPTH: usize = 64;
-/// Largest embedded image, once inflated.
+/// Largest embedded image, once inflated, and largest total of them all: compressed data can
+/// inflate a thousandfold.
 const MAX_EMBEDDED_IMAGE: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_EMBEDDED: u64 = 1024 * 1024 * 1024;
 
 const PAGE_OBJECTS: &[&str] = &["PAGEOBJECT", "PageObject"];
 const MASTER_OBJECTS: &[&str] = &["MASTEROBJECT", "MasterObject"];
@@ -239,6 +241,8 @@ struct Importer<'a> {
     unsupported_links: BTreeSet<String>,
     skipped: BTreeMap<&'static str, usize>,
     items: usize,
+    /// Bytes of embedded images inflated so far (see [`MAX_TOTAL_EMBEDDED`]).
+    embedded_bytes: u64,
 }
 
 impl<'a> Importer<'a> {
@@ -270,6 +274,7 @@ impl<'a> Importer<'a> {
             unsupported_links: BTreeSet::new(),
             skipped: BTreeMap::new(),
             items: 0,
+            embedded_bytes: 0,
         }
     }
 
@@ -337,6 +342,10 @@ impl<'a> Importer<'a> {
     fn colors(&mut self, doc: &El) {
         for c in doc.named(&["COLOR", "Color"]) {
             let Some(name) = c.any(&["Name", "NAME"]).map(str::trim).filter(|n| !n.is_empty() && *n != "None") else { continue };
+            // The first definition of a name wins (as later references can only mean one).
+            if self.palette.map.contains_key(name) {
+                continue;
+            }
             if c.flag(&["Register", "REGISTER"]) == Some(true) {
                 self.palette.map.insert(name.to_string(), sw::REGISTRATION.into());
                 continue;
@@ -893,8 +902,16 @@ impl<'a> Importer<'a> {
         let (asset, size) = match (embedded, &file) {
             (Some(data), _) => {
                 let ext = e.get("inlineImageExt").unwrap_or("");
-                match inflate_embedded(data) {
-                    Some(bytes) => self.add_asset(bytes, file.as_deref().or(Some(ext)).unwrap_or("image"), None, fallback),
+                let budget = MAX_TOTAL_EMBEDDED.saturating_sub(self.embedded_bytes);
+                match inflate_embedded(data, budget) {
+                    Some(bytes) => {
+                        self.embedded_bytes = self.embedded_bytes.saturating_add(bytes.len() as u64);
+                        self.add_asset(bytes, file.as_deref().or(Some(ext)).unwrap_or("image"), None, fallback)
+                    }
+                    None if budget < MAX_EMBEDDED_IMAGE => {
+                        *self.skipped.entry("embedded images past the 1 GB total").or_default() += 1;
+                        return Content::Unassigned;
+                    }
                     None => {
                         self.warnings.push("an embedded image couldn't be read".into());
                         return Content::Unassigned;
@@ -1080,12 +1097,14 @@ fn mime_from_name(path: &str) -> String {
 
 /// An embedded image (`ImageData`): base64 of Qt's compressed form, a 4-byte big-endian length
 /// followed by a zlib stream.
-fn inflate_embedded(b64: &str) -> Option<Vec<u8>> {
+/// `None` when it can't be read or inflates past `budget` (or [`MAX_EMBEDDED_IMAGE`]).
+fn inflate_embedded(b64: &str, budget: u64) -> Option<Vec<u8>> {
+    let cap = budget.min(MAX_EMBEDDED_IMAGE);
     let raw = base64_decode(b64)?;
     let stream = raw.get(4..)?;
     let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(stream).take(MAX_EMBEDDED_IMAGE + 1).read_to_end(&mut out).ok()?;
-    (!out.is_empty() && out.len() as u64 <= MAX_EMBEDDED_IMAGE).then_some(out)
+    flate2::read::ZlibDecoder::new(stream).take(cap.saturating_add(1)).read_to_end(&mut out).ok()?;
+    (!out.is_empty() && out.len() as u64 <= cap).then_some(out)
 }
 
 /// Standard base64 (whitespace ignored); `None` on any other character.
@@ -1124,6 +1143,34 @@ mod unit_tests {
         assert_eq!(base64_decode("aGVsbG8=").as_deref(), Some(&b"hello"[..]));
         assert_eq!(base64_decode("aGVs\nbG8").as_deref(), Some(&b"hello"[..]));
         assert_eq!(base64_decode("a$b"), None);
+    }
+
+    #[test]
+    fn embedded_images_stop_at_their_budget() {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(&[0u8; 4096]).unwrap();
+        let mut q = 4096u32.to_be_bytes().to_vec();
+        q.extend(z.finish().unwrap());
+        let b64 = crate::tests::base64(&q);
+        assert_eq!(inflate_embedded(&b64, 4096).map(|b| b.len()), Some(4096));
+        assert_eq!(inflate_embedded(&b64, 4095), None, "past the remaining budget");
+        assert_eq!(inflate_embedded(&b64, 0), None);
+    }
+
+    #[test]
+    fn repeated_colour_names_keep_their_first_definition() {
+        let mut colours = String::new();
+        for i in 0..5000 {
+            colours.push_str(&format!(r#"<Color Name="X" Space="RGB" R="{}" G="0" B="0"/>"#, i % 256));
+        }
+        let sla = format!(r#"<SCRIBUSUTF8NEW Version="1.7"><Document>{colours}<Page PageWidth="10" PageHeight="10"/></Document></SCRIBUSUTF8NEW>"#);
+        let started = std::time::Instant::now();
+        let d = import_sla(sla.as_bytes(), &|_| None).unwrap();
+        assert!(started.elapsed().as_secs() < 5, "repeats must not cost quadratic time");
+        let xs: Vec<_> = d.swatches.iter().filter(|s| s.name.starts_with('X')).collect();
+        assert_eq!(xs.len(), 1, "no orphaned copies");
+        assert!(matches!(xs[0].value, SwatchValue::Color { color: Color::Rgb { r, .. }, .. } if r == 0.0));
     }
 
     #[test]

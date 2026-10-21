@@ -402,3 +402,20 @@ fn hostile_documents_are_errors_or_warnings_never_panics() {
     }
     assert!(im.warnings.iter().any(|w| w.contains("nested too deeply")), "{:?}", im.warnings);
 }
+
+#[test]
+fn items_without_a_page_stop_scanning_pages_past_the_lookup_budget() {
+    // 1000 pages × 10 100 items without `OwnPage`: one past the budget, which goes on page 1.
+    let mut body = String::new();
+    for n in 0..1000 {
+        body.push_str(&format!(r#"<Page PageXPosition="{}" PageYPosition="0" PageWidth="10" PageHeight="10" PageNumber="{n}"/>"#, n * 20));
+    }
+    for _ in 0..10_100 {
+        body.push_str(r#"<PageObject ItemType="6" XPosition="19985" YPosition="5" Width="1" Height="1"/>"#);
+    }
+    let im = import(&format!(r#"<SCRIBUSUTF8NEW Version="1.7.2"><Document>{body}</Document></SCRIBUSUTF8NEW>"#));
+    im.document.check().unwrap();
+    assert!(im.warnings.iter().any(|w| w.starts_with("100 items without a page of their own")), "{:?}", im.warnings);
+    assert_eq!(im.document.spreads.iter().map(|s| s.items.len()).sum::<usize>(), 10_100);
+    assert_eq!(items(&im.document, 0).len(), 100);
+}

@@ -57,6 +57,9 @@ const MAX_EMBEDDED_IMAGE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_EMBEDDED: u64 = 1024 * 1024 * 1024;
 /// Most bytes all linked images may hold together: what a `.designcraft` file can store.
 const MAX_TOTAL_LINKED: u64 = 4 << 30;
+/// Page rects compared, in total, to find the page under items without a usable `OwnPage`:
+/// past it such items go on the first page, so a hostile file can't make the lookup quadratic.
+const MAX_PAGE_LOOKUPS: usize = 10_000_000;
 
 const PAGE_OBJECTS: &[&str] = &["PAGEOBJECT", "PageObject"];
 const MASTER_OBJECTS: &[&str] = &["MASTEROBJECT", "MasterObject"];
@@ -250,6 +253,10 @@ struct Importer<'a> {
     embedded_bytes: u64,
     /// Bytes of linked images read so far (see [`MAX_TOTAL_LINKED`]).
     linked_bytes: u64,
+    /// Page rects compared so far (see [`MAX_PAGE_LOOKUPS`]).
+    page_lookups: usize,
+    /// Items put on the first page because the lookup budget was used up.
+    unplaced: usize,
 }
 
 impl<'a> Importer<'a> {
@@ -283,6 +290,8 @@ impl<'a> Importer<'a> {
             items: 0,
             embedded_bytes: 0,
             linked_bytes: 0,
+            page_lookups: 0,
+            unplaced: 0,
         }
     }
 
@@ -333,7 +342,8 @@ impl<'a> Importer<'a> {
         s.page_height = doc.num(&["PageHeight", "PAGEHEIGHT"]).filter(|h| *h > 0.0).unwrap_or(841.89).clamp(1.0, 15_552.0);
         s.facing_pages = doc.num(&["PagePositioning", "BOOK"]).is_some_and(|p| p != 0.0);
         let bleed = |k: &[&str]| doc.num(k).unwrap_or(0.0).clamp(0.0, 1000.0);
-        // Top, bottom, inside, outside.
+        // DesignCraft's order is top, bottom, inside, outside; Scribus keeps inside as Left and
+        // outside as Right (its facing-pages labels).
         s.bleed = [bleed(&["BleedTop"]), bleed(&["BleedBottom"]), bleed(&["BleedLeft"]), bleed(&["BleedRight"])];
         let unit = match doc.num(&["UnitIndex", "UNITS"]).map(|u| u as i64) {
             Some(1) => Unit::Millimeters,
@@ -721,8 +731,8 @@ impl<'a> Importer<'a> {
     }
 
     /// The spread a page item goes on, and that spread's canvas origin: the page that owns it,
-    /// else the page it lies on (or nearest).
-    fn spread_for(&self, e: &El) -> Option<(usize, (f64, f64))> {
+    /// else the page it lies on (or nearest; the first page once [`MAX_PAGE_LOOKUPS`] is used up).
+    fn spread_for(&mut self, e: &El) -> Option<(usize, (f64, f64))> {
         if let Some(own) = e.num(&["OwnPage"]).filter(|p| *p >= 0.0).map(|p| p as usize)
             && let Some(at) = self.page_spread.get(own)
         {
@@ -735,6 +745,11 @@ impl<'a> Importer<'a> {
             let dy = (r.y0 - y).max(y - r.y1).max(0.0);
             dx.hypot(dy)
         };
+        self.page_lookups = self.page_lookups.saturating_add(self.page_rects.len());
+        if self.page_lookups > MAX_PAGE_LOOKUPS {
+            self.unplaced = self.unplaced.saturating_add(1);
+            return self.page_spread.first().copied();
+        }
         let nearest = self.page_rects.iter().enumerate().min_by(|a, b| distance(a.1).total_cmp(&distance(b.1)))?.0;
         self.page_spread.get(nearest).copied()
     }
@@ -1014,6 +1029,9 @@ impl<'a> Importer<'a> {
         let mut warnings = std::mem::take(&mut self.warnings);
         for (what, n) in &self.skipped {
             warnings.push(format!("{n} {what} not imported"));
+        }
+        if self.unplaced > 0 {
+            warnings.push(format!("{} items without a page of their own were put on the first page", self.unplaced));
         }
         if !self.missing_links.is_empty() {
             let list: Vec<&str> = self.missing_links.iter().map(String::as_str).take(20).collect();

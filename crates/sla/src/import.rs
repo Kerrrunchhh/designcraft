@@ -12,7 +12,7 @@ use designcraft_doc::{
 };
 use designcraft_geom::{Affine, BezPath, PathData, Rect, Unit, shapes};
 
-use crate::text::{self, StoryBuilder, StyleNames};
+use crate::text::{self, ShadowAttrs, StoryBuilder, StoryShadow, StyleNames, TextShadow};
 use crate::xml::{self, El};
 use crate::{Result, SlaError};
 
@@ -237,6 +237,10 @@ struct Importer<'a> {
     stories: BTreeMap<StoryId, Story>,
     /// Scribus `ItemID` of a text frame → its story.
     story_of: HashMap<i64, StoryId>,
+    /// Stories whose text is all shadowed, and the shadow: their frames cast it.
+    story_shadow: HashMap<StoryId, TextShadow>,
+    /// Stories only partly shadowed (their shadows are left out).
+    partly_shadowed: usize,
     /// Scribus `ItemID` → the DesignCraft frame made for it.
     frame_ids: HashMap<i64, ItemId>,
     /// Each story's frames in thread order, by Scribus `ItemID`.
@@ -279,6 +283,8 @@ impl<'a> Importer<'a> {
             sections: Vec::new(),
             stories: BTreeMap::new(),
             story_of: HashMap::new(),
+            story_shadow: HashMap::new(),
+            partly_shadowed: 0,
             frame_ids: HashMap::new(),
             threads: BTreeMap::new(),
             loose_frames: Vec::new(),
@@ -315,18 +321,16 @@ impl<'a> Importer<'a> {
                 *self.skipped.entry("master items on a master page that doesn't exist").or_default() += 1;
                 continue;
             };
-            if let Some(item) = self.item(e, origin, 0)
-                && let Some(s) = self.parents.get_mut(si)
-            {
-                s.items.push(Arc::new(item));
+            let items = self.item(e, origin, 0);
+            if let Some(s) = self.parents.get_mut(si) {
+                s.items.extend(items.into_iter().map(Arc::new));
             }
         }
         for e in doc.named(PAGE_OBJECTS) {
             let Some((si, origin)) = self.spread_for(e) else { continue };
-            if let Some(item) = self.item(e, origin, 0)
-                && let Some(s) = self.spreads.get_mut(si)
-            {
-                s.items.push(Arc::new(item));
+            let items = self.item(e, origin, 0);
+            if let Some(s) = self.spreads.get_mut(si) {
+                s.items.extend(items.into_iter().map(Arc::new));
             }
         }
         // `FRAMEOBJECT`s are the frames of inline objects. The text that would anchor them is
@@ -408,6 +412,24 @@ impl<'a> Importer<'a> {
         }
         // Character styles, flattened onto their parents in DesignCraft's own `based_on`.
         let by_name: HashMap<&str, &El> = char_els.iter().filter_map(|e| Some((e.any(&["CName", "Name", "CNAME"])?, *e))).collect();
+        // Text shadows aren't a character attribute in DesignCraft: each style's, with its
+        // parents', is kept for the runs that use it (see `story_shadow`).
+        self.names.base_shadow = default_char.map(ShadowAttrs::read).unwrap_or_default();
+        for (name, e) in &by_name {
+            let mut chain = vec![*e];
+            let mut seen = BTreeSet::from([*name]);
+            let mut parent = e.any(&["CParent", "CPARENT"]);
+            while let Some(p) = parent.filter(|p| seen.insert(p) && seen.len() < 32) {
+                let Some(pe) = by_name.get(p).filter(|pe| !is_default(pe)) else { break };
+                chain.push(*pe);
+                parent = pe.any(&["CParent", "CPARENT"]);
+            }
+            let mut attrs = ShadowAttrs::default();
+            for ce in chain.iter().rev() {
+                attrs.merge(&ShadowAttrs::read(ce));
+            }
+            self.names.char_shadows.insert(name.to_string(), attrs);
+        }
         for e in &char_els {
             if is_default(e) {
                 continue;
@@ -720,13 +742,25 @@ impl<'a> Importer<'a> {
             if b.truncated {
                 self.warnings.push("a story longer than 64 MB was cut short".into());
             }
+            let shadow = b.shadow();
             let story = b.finish(sid);
+            self.note_shadow(sid, shadow);
             let ids: Vec<i64> = chain.iter().filter_map(|i| frames.get(*i).map(|f| f.0)).collect();
             for id in &ids {
                 self.story_of.insert(*id, sid);
             }
             self.stories.insert(sid, story);
             self.threads.insert(sid, ids);
+        }
+    }
+
+    fn note_shadow(&mut self, sid: StoryId, shadow: StoryShadow) {
+        match shadow {
+            StoryShadow::None => {}
+            StoryShadow::All(sh) => {
+                self.story_shadow.insert(sid, sh);
+            }
+            StoryShadow::Partial => self.partly_shadowed = self.partly_shadowed.saturating_add(1),
         }
     }
 
@@ -759,11 +793,12 @@ impl<'a> Importer<'a> {
         self.layer_of.get(&number).or_else(|| self.layer_of.values().min_by_key(|(_, level)| *level)).map(|(id, _)| *id).unwrap_or(LayerId(0))
     }
 
-    /// The item for `e`, placed relative to `origin` (its spread's canvas origin, or its group's).
-    fn item(&mut self, e: &El, origin: (f64, f64), depth: usize) -> Option<Item> {
+    /// The items for `e`, placed relative to `origin` (its spread's canvas origin, or its
+    /// group's): one, or two for a shadowed text frame with a fill or stroke.
+    fn item(&mut self, e: &El, origin: (f64, f64), depth: usize) -> Vec<Item> {
         if self.items >= MAX_ITEMS {
             *self.skipped.entry("items past the import limit").or_default() += 1;
-            return None;
+            return Vec::new();
         }
         self.items += 1;
         let kind = item_type(e);
@@ -777,7 +812,7 @@ impl<'a> Importer<'a> {
         };
         if let Some(reason) = reason {
             *self.skipped.entry(reason).or_default() += 1;
-            return None;
+            return Vec::new();
         }
         let x = e.num(&["XPosition", "XPOS"]).unwrap_or(0.0);
         let y = e.num(&["YPosition", "YPOS"]).unwrap_or(0.0);
@@ -854,19 +889,24 @@ impl<'a> Importer<'a> {
                         let sid = StoryId(self.alloc());
                         let mut b = StoryBuilder::new(&self.names);
                         b.read(e.find(&["StoryText"]).unwrap_or(e), &mut self.palette);
+                        let shadow = b.shadow();
                         self.stories.insert(sid, b.finish(sid));
+                        self.note_shadow(sid, shadow);
                         self.loose_frames.push((sid, id));
                         sid
                     }
                 };
                 item.content = Content::Text(TextFrame { story, options: text_options(e) });
+                if let Some(sh) = self.story_shadow.get(&story) {
+                    return self.shadowed_frame(item, sh.clone(), rotation);
+                }
             }
             12 => {
                 let group_xf = Affine::rotate(-rotation.to_radians());
                 let mut items = Vec::new();
                 if depth < MAX_GROUP_DEPTH {
                     for c in e.named(ITEM_ELEMENTS) {
-                        if let Some(mut child) = self.item(c, (x, y), depth + 1) {
+                        for mut child in self.item(c, (x, y), depth + 1) {
                             child.xf = group_xf * child.xf;
                             items.push(Arc::new(child));
                         }
@@ -875,7 +915,7 @@ impl<'a> Importer<'a> {
                     *self.skipped.entry("groups nested too deeply").or_default() += 1;
                 }
                 if items.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 item.fill = Fill::none();
                 item.stroke = Stroke::none();
@@ -883,7 +923,38 @@ impl<'a> Importer<'a> {
             }
             _ => {}
         }
-        Some(item)
+        vec![item]
+    }
+
+    /// A text frame whose text casts Scribus' text shadow. DesignCraft has no character shadow;
+    /// a frame's drop shadow is the shadow of its text when the frame has no fill or stroke, so
+    /// those move to a rectangle of their own behind it. Scribus offsets the shadow in the
+    /// frame's text space, a drop shadow on the page.
+    fn shadowed_frame(&mut self, mut item: Item, sh: TextShadow, rotation: f64) -> Vec<Item> {
+        let mut items = Vec::new();
+        if !item.fill.is_none() || !item.stroke.is_none() {
+            let mut back = Item::new(ItemId(self.alloc()), item.layer, item.shape, item.path.clone());
+            back.xf = item.xf;
+            back.name = item.name.clone();
+            back.locked = item.locked;
+            back.nonprinting = item.nonprinting;
+            back.opacity = item.opacity;
+            back.fill = std::mem::replace(&mut item.fill, Fill::none());
+            back.stroke = std::mem::replace(&mut item.stroke, Stroke::none());
+            items.push(back);
+        }
+        let off = Affine::rotate(rotation.to_radians()) * designcraft_geom::Point::new(sh.dx, sh.dy);
+        let ds = &mut item.effects.drop_shadow;
+        ds.on = true;
+        ds.color = sh.color;
+        ds.opacity = sh.tint;
+        // The drop shadow's angle is where the light comes from: opposite the offset.
+        ds.angle = off.y.atan2(-off.x).to_degrees();
+        ds.distance = off.to_vec2().hypot();
+        ds.size = 0.0;
+        ds.spread = 0.0;
+        items.push(item);
+        items
     }
 
     fn fill(&mut self, e: &El) -> Fill {
@@ -1029,6 +1100,9 @@ impl<'a> Importer<'a> {
         let mut warnings = std::mem::take(&mut self.warnings);
         for (what, n) in &self.skipped {
             warnings.push(format!("{n} {what} not imported"));
+        }
+        if self.partly_shadowed > 0 {
+            warnings.push(format!("text shadows on part of a story are not imported ({} stories)", self.partly_shadowed));
         }
         if self.unplaced > 0 {
             warnings.push(format!("{} items without a page of their own were put on the first page", self.unplaced));

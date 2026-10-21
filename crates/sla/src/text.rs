@@ -91,6 +91,10 @@ pub fn split_font(name: &str, known: &dyn Fn(&str) -> bool) -> (String, String) 
 pub struct StyleNames {
     pub para: HashMap<String, String>,
     pub chars: HashMap<String, String>,
+    /// The text shadow each Scribus character style sets (its parents' included), and the one
+    /// the document's default character style sets.
+    pub char_shadows: HashMap<String, ShadowAttrs>,
+    pub base_shadow: ShadowAttrs,
 }
 
 impl StyleNames {
@@ -153,6 +157,93 @@ pub fn char_attrs(e: &El, palette: &mut Palette<'_>) -> CharAttrs {
         }
     }
     a
+}
+
+/// Scribus' text shadow (feature `shadowed`): a hard copy of the glyphs in the stroke colour,
+/// offset by percentages of the font size (x to the right, y up). Each field is what one element
+/// (a style, a story default, a run) sets; unset fields inherit.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShadowAttrs {
+    pub on: Option<bool>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub color: Option<String>,
+    pub shade: Option<f64>,
+}
+
+impl ShadowAttrs {
+    /// The shadow attributes `e` sets. A feature list without `inherit` replaces the inherited
+    /// features, so it turns the shadow off unless it names it.
+    pub fn read(e: &El) -> ShadowAttrs {
+        let on = e.any(&["Features", "FEATURES"]).and_then(|f| {
+            let has = |word: &str| f.split_whitespace().any(|w| w == word);
+            if has("shadowed") {
+                Some(true)
+            } else if has("inherit") {
+                None
+            } else {
+                Some(false)
+            }
+        });
+        let pct = |keys: &[&str]| e.num(keys).map(|v| v.clamp(-1000.0, 1000.0));
+        ShadowAttrs {
+            on,
+            x: pct(&["TextShadowXOffset", "TXTSHX"]),
+            y: pct(&["TextShadowYOffset", "TXTSHY"]),
+            color: e.any(&["StrokeColor", "SCOLOR"]).map(str::to_string),
+            shade: e.num(&["StrokeShade", "SSHADE"]),
+        }
+    }
+
+    pub fn merge(&mut self, o: &ShadowAttrs) {
+        if o.on.is_some() {
+            self.on = o.on;
+        }
+        if o.x.is_some() {
+            self.x = o.x;
+        }
+        if o.y.is_some() {
+            self.y = o.y;
+        }
+        if o.color.is_some() {
+            self.color.clone_from(&o.color);
+        }
+        if o.shade.is_some() {
+            self.shade = o.shade;
+        }
+    }
+
+    /// The shadow these attributes cast from text `size` points high, if they turn it on.
+    fn resolve(&self, size: f64, palette: &mut Palette<'_>) -> Option<TextShadow> {
+        if self.on != Some(true) {
+            return None;
+        }
+        Some(TextShadow {
+            dx: self.x.unwrap_or(5.0) / 100.0 * size,
+            dy: -self.y.unwrap_or(-5.0) / 100.0 * size,
+            color: palette.swatch(self.color.as_deref().unwrap_or("Black")),
+            tint: shade(self.shade.unwrap_or(100.0)),
+        })
+    }
+}
+
+/// A run's text shadow: offset in points in the frame's text space (y down), swatch and tint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextShadow {
+    pub dx: f64,
+    pub dy: f64,
+    pub color: String,
+    pub tint: f32,
+}
+
+/// How a story's text is shadowed.
+#[derive(Debug, PartialEq)]
+pub enum StoryShadow {
+    None,
+    /// All its visible text, with this shadow (the one most of it casts).
+    All(TextShadow),
+    /// Only part of it.
+    Partial,
 }
 
 /// The paragraph attributes `e` sets, and the leading (a character attribute in DesignCraft).
@@ -221,6 +312,7 @@ struct Para {
 struct Run {
     text: String,
     format: CharFormat,
+    shadow: Option<TextShadow>,
     para: usize,
 }
 
@@ -233,6 +325,7 @@ pub struct StoryBuilder<'a> {
     base_para: ParaFormat,
     base_leading: Option<Leading>,
     base_chars: CharAttrs,
+    base_shadow: ShadowAttrs,
     pub truncated: bool,
 }
 
@@ -246,6 +339,7 @@ impl<'a> StoryBuilder<'a> {
             base_para: ParaFormat::default(),
             base_leading: None,
             base_chars: CharAttrs::default(),
+            base_shadow: ShadowAttrs::default(),
             truncated: false,
         }
     }
@@ -259,10 +353,12 @@ impl<'a> StoryBuilder<'a> {
                     self.base_para = ParaFormat { style: self.names.para(e.any(&["Parent", "PARENT"])), para, ..Default::default() };
                     self.base_leading = leading;
                     self.base_chars = char_attrs(e, palette);
+                    self.base_shadow = ShadowAttrs::read(e);
                 }
                 "ITEXT" | "Content" => {
                     let chars = e.any(&["Chars", "CH"]).unwrap_or("");
                     let format = self.run_format(e, palette);
+                    let shadow = self.run_shadow(e, &format, palette);
                     // Old files can hold paragraph separators inside the run.
                     let mut first = true;
                     for piece in chars.split(['\r', '\n', '\u{2029}']) {
@@ -271,7 +367,7 @@ impl<'a> StoryBuilder<'a> {
                         }
                         first = false;
                         let clean: String = piece.chars().filter(|c| *c == '\t' || !c.is_control()).collect();
-                        self.push(&clean, &format);
+                        self.push(&clean, &format, shadow.as_ref());
                     }
                 }
                 "tab" => self.push_special(e, "\t", palette),
@@ -321,12 +417,25 @@ impl<'a> StoryBuilder<'a> {
         CharFormat { style: self.names.chars(e.any(&["CParent", "CPARENT"])), over }
     }
 
-    fn push_special(&mut self, e: &El, s: &str, palette: &mut Palette<'_>) {
-        let format = self.run_format(e, palette);
-        self.push(s, &format);
+    /// The shadow a run casts: the document default's, its character style's, the story
+    /// default's and its own attributes in turn.
+    fn run_shadow(&self, e: &El, format: &CharFormat, palette: &mut Palette<'_>) -> Option<TextShadow> {
+        let mut attrs = self.names.base_shadow.clone();
+        if let Some(style) = e.any(&["CParent", "CPARENT"]).and_then(|p| self.names.char_shadows.get(p)) {
+            attrs.merge(style);
+        }
+        attrs.merge(&self.base_shadow);
+        attrs.merge(&ShadowAttrs::read(e));
+        attrs.resolve(format.over.size.unwrap_or(12.0), palette)
     }
 
-    fn push(&mut self, s: &str, format: &CharFormat) {
+    fn push_special(&mut self, e: &El, s: &str, palette: &mut Palette<'_>) {
+        let format = self.run_format(e, palette);
+        let shadow = self.run_shadow(e, &format, palette);
+        self.push(s, &format, shadow.as_ref());
+    }
+
+    fn push(&mut self, s: &str, format: &CharFormat, shadow: Option<&TextShadow>) {
         if s.is_empty() || self.truncated {
             return;
         }
@@ -337,8 +446,8 @@ impl<'a> StoryBuilder<'a> {
         self.bytes += s.len();
         let para = self.paras.len().saturating_sub(1);
         match self.runs.last_mut() {
-            Some(r) if r.para == para && r.format == *format => r.text.push_str(s),
-            _ => self.runs.push(Run { text: s.to_string(), format: format.clone(), para }),
+            Some(r) if r.para == para && r.format == *format && r.shadow.as_ref() == shadow => r.text.push_str(s),
+            _ => self.runs.push(Run { text: s.to_string(), format: format.clone(), shadow: shadow.cloned(), para }),
         }
     }
 
@@ -360,7 +469,7 @@ impl<'a> StoryBuilder<'a> {
             self.truncated = true;
             return;
         }
-        self.push("\n", mark);
+        self.push("\n", mark, None);
         if let Some(f) = format {
             self.style_open(f, leading);
         }
@@ -370,6 +479,27 @@ impl<'a> StoryBuilder<'a> {
     /// Whether anything has been read (text or paragraph marks).
     pub fn is_empty(&self) -> bool {
         self.runs.is_empty()
+    }
+
+    /// How the story's visible text is shadowed.
+    pub fn shadow(&self) -> StoryShadow {
+        let mut visible = 0usize;
+        let mut shadows: Vec<(&TextShadow, usize)> = Vec::new();
+        for r in &self.runs {
+            let n = r.text.chars().filter(|c| !c.is_whitespace() && !c.is_control()).count();
+            visible = visible.saturating_add(n);
+            let Some(sh) = r.shadow.as_ref().filter(|_| n > 0) else { continue };
+            match shadows.iter_mut().find(|(s, _)| *s == sh) {
+                Some((_, count)) => *count = count.saturating_add(n),
+                None => shadows.push((sh, n)),
+            }
+        }
+        let shadowed: usize = shadows.iter().map(|(_, n)| n).sum();
+        match shadows.iter().max_by_key(|(_, n)| *n) {
+            None => StoryShadow::None,
+            Some((sh, _)) if shadowed == visible => StoryShadow::All((*sh).clone()),
+            Some(_) => StoryShadow::Partial,
+        }
     }
 
     pub fn finish(mut self, id: StoryId) -> Story {

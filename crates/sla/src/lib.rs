@@ -25,13 +25,17 @@
 //! Page size, facing pages, bleed, margins, ruler guides, sections, layers, master pages (as
 //! one-page parents), colours (CMYK, RGB, Lab, spot, registration), paragraph and character
 //! styles with their parents, text frames (columns, insets, vertical alignment), threading,
-//! character and paragraph overrides, tabs, drop caps, image frames (linked or embedded), shapes
-//! (rectangles, ellipses, polygons, Bézier paths, lines, polylines, arcs, spirals), groups,
-//! rotation, flipping, fill and stroke colours with shades, stroke weight, opacity.
+//! character and paragraph overrides, tabs, drop caps, image frames (linked or embedded),
+//! shapes (rectangles, ellipses, polygons, Bézier paths, lines, polylines, arcs, spirals),
+//! groups, rotation, flipping, fill and stroke colours with shades, stroke weight, opacity.
+//! Text shadows: DesignCraft has no character shadow, so a frame whose text is all shadowed
+//! casts a hard drop shadow (Scribus' offset turned with the frame, the stroke colour), and its
+//! fill and stroke move to a rectangle behind it so only the text casts it.
 //!
 //! ## Not imported (reported as warnings)
 //! Tables, text on a path (imported as a plain text frame), inline objects, LaTeX/render
-//! frames, symbols, notes, gradients and patterns (the first colour is used), image effects.
+//! frames, symbols, notes, gradients and patterns (the first colour is used), image effects,
+//! text shadows on part of a story.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

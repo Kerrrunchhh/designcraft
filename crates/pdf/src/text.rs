@@ -466,11 +466,8 @@ impl Exporter<'_> {
         let g0 = &glyphs[0];
         let st = &cs.styles[g0.style as usize];
         let face = g0.face;
-        let size = g0.sy * face.upem;
         let hs = g0.sx / g0.sy;
-        let tan = if st.skew != 0.0 { st.skew.to_radians().tan() } else { 0.0 };
-        let skew = if st.skew != 0.0 { Affine::new([1.0, 0.0, -tan, 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
-        let origin = Affine::translate((g0.x, baseline + g0.y)) * skew * Affine::scale_non_uniform(hs, 1.0);
+        let (size, tan, origin) = run_origin(cs, g0, baseline);
         // Outside a frame (no text area), a gradient spans the run.
         let end = glyphs.last().map_or(g0.x, |g| g.x + g.adv);
         let run_area = Rect::new(g0.x, baseline - size, end.max(g0.x + 1.0), baseline + size * 0.25);
@@ -620,6 +617,42 @@ impl Exporter<'_> {
         s.draw_glyphs(Point::from_xy(at.0 as f32, at.1 as f32), &glyphs, font, text, size as f32, false);
         s.set_fill(None);
     }
+}
+
+/// A run's font size, skew (the tangent of its angle) and origin (text space ← run space).
+fn run_origin(cs: &ComposedStory, g0: &PlacedGlyph, baseline: f64) -> (f64, f64, Affine) {
+    let skew = cs.styles.get(g0.style as usize).map_or(0.0, |st| st.skew);
+    let tan = if skew != 0.0 { skew.to_radians().tan() } else { 0.0 };
+    let shear = if skew != 0.0 { Affine::new([1.0, 0.0, -tan, 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
+    let origin = Affine::translate((g0.x, baseline + g0.y)) * shear * Affine::scale_non_uniform(g0.sx / g0.sy, 1.0);
+    (g0.sy * g0.face.upem, tan, origin)
+}
+
+/// The outlines of a frame's visible glyphs in text space, turned and slanted as they are drawn:
+/// the silhouette a drop shadow on a frame without a fill casts.
+pub(crate) fn glyph_silhouette(cs: &ComposedStory, ft: &FrameText) -> BezPath {
+    let mut bp = BezPath::new();
+    for l in &ft.lines {
+        let gs = &l.glyphs;
+        let mut i = 0;
+        while let Some(g) = gs.get(i) {
+            if !g.visible || g.sx <= 0.0 || g.sy <= 0.0 {
+                i += 1;
+                continue;
+            }
+            let turn = if ft.vertical { g.vertical_xf(l.baseline) } else { None };
+            let shatai = cs.styles.get(g.style as usize).and_then(|st| st.shatai_xf(g, l.baseline));
+            let j = if turn.is_some() || shatai.is_some() { i + 1 } else { run_end(ft, gs, i) };
+            let Some(run) = gs.get(i..j) else { break };
+            let (size, tan, origin) = run_origin(cs, g, l.baseline);
+            let m = turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY) * origin;
+            let mut o = glyph_outlines(run, size, tan);
+            o.apply_affine(m);
+            bp.extend(o.iter());
+            i = j;
+        }
+    }
+    bp
 }
 
 /// A run's glyph outlines at `size`, relative to its first glyph's origin. A vertical offset (a

@@ -419,3 +419,53 @@ fn items_without_a_page_stop_scanning_pages_past_the_lookup_budget() {
     assert_eq!(im.document.spreads.iter().map(|s| s.items.len()).sum::<usize>(), 10_100);
     assert_eq!(items(&im.document, 0).len(), 100);
 }
+
+#[test]
+fn shadowed_text_casts_a_hard_drop_shadow_from_its_frame() {
+    // A spine title: a filled frame turned 90°, all its text shadowed (5 % right and down of
+    // 20 pt text: 1 pt each way, which the turn makes 1 pt left and 1 pt down on the page).
+    // A frame whose text is only partly shadowed keeps no shadow, with a warning; one whose
+    // runs are shadowed through a character style casts the style's offset and colour.
+    let im = import(
+        r##"<SCRIBUSUTF8NEW Version="1.7.2"><Document>
+  <Color Name="Black" Space="CMYK" C="0" M="0" Y="0" K="100"/>
+  <Color Name="Red" Space="RGB" R="200" G="40" B="20"/>
+  <Color Name="Sky" Space="RGB" R="0" G="128" B="255"/>
+  <CharacterStyle Name="Default Character Style" DefaultStyle="1" FontSize="12" Features="inherit" StrokeColor="Black" StrokeShade="100" TextShadowXOffset="5" TextShadowYOffset="-5"/>
+  <CharacterStyle Name="Glow" Features="inherit shadowed" StrokeColor="Sky" StrokeShade="50" TextShadowXOffset="10" TextShadowYOffset="0"/>
+  <Page PageXPosition="0" PageYPosition="0" PageWidth="300" PageHeight="400" PageNumber="0"/>
+  <PageObject XPosition="50" YPosition="10" OwnPage="0" ItemID="1" ItemType="4" Width="300" Height="30" Rotation="90" FillColor="Red" LineColor="Black" LineWidth="2">
+    <StoryText><DefaultStyle FontSize="20"/><Content Features="inherit shadowed" Chars="Spine title"/><trail/></StoryText>
+  </PageObject>
+  <PageObject XPosition="100" YPosition="10" OwnPage="0" ItemID="2" ItemType="4" Width="100" Height="30">
+    <StoryText><DefaultStyle/><Content Features="inherit shadowed" Chars="Half"/><Content Chars=" plain"/><trail/></StoryText>
+  </PageObject>
+  <PageObject XPosition="100" YPosition="50" OwnPage="0" ItemID="3" ItemType="4" Width="100" Height="30">
+    <StoryText><DefaultStyle/><Content CParent="Glow" FontSize="10" Chars="Styled"/><trail/></StoryText>
+  </PageObject>
+</Document></SCRIBUSUTF8NEW>"##,
+    );
+    im.document.check().unwrap();
+    let it = items(&im.document, 0);
+    assert_eq!(it.len(), 4, "the spine frame's fill and stroke go to a rectangle of their own");
+
+    let (back, spine) = (it[0], it[1]);
+    assert!(matches!(back.content, Content::Unassigned));
+    assert_eq!((back.fill.swatch.as_str(), back.stroke.weight), ("Red", 2.0));
+    assert_eq!(back.xf, spine.xf);
+    assert!(spine.fill.is_none() && spine.stroke.is_none());
+    let ds = &spine.effects.drop_shadow;
+    assert!(ds.on && ds.size == 0.0 && ds.opacity == 1.0 && ds.color == swatch::BLACK, "{ds:?}");
+    // The renderer's offset for a light angle: (-cos, sin) × distance.
+    let a = ds.angle.to_radians();
+    let off = (-a.cos() * ds.distance, a.sin() * ds.distance);
+    assert!(near(off.0, -1.0) && near(off.1, 1.0), "{off:?}");
+
+    assert!(!it[2].effects.drop_shadow.on);
+    assert!(im.warnings.iter().any(|w| w.starts_with("text shadows on part of a story")), "{:?}", im.warnings);
+
+    let ds = &it[3].effects.drop_shadow;
+    assert!(ds.on && ds.color == "Sky" && near(f64::from(ds.opacity), 0.5), "{ds:?}");
+    let a = ds.angle.to_radians();
+    assert!(near(-a.cos() * ds.distance, 1.0) && near(a.sin() * ds.distance, 0.0), "{ds:?}");
+}

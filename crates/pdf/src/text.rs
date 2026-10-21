@@ -259,30 +259,14 @@ impl Exporter<'_> {
                 }
             });
         }
-        for l in &ft.lines {
-            let gs = &l.glyphs;
-            let mut i = 0;
-            while i < gs.len() {
-                let g = &gs[i];
-                if !g.visible || g.sx <= 0.0 || g.sy <= 0.0 {
-                    i += 1;
-                    continue;
-                }
-                // Vertical type: an upright glyph turns back a quarter about its em box centre.
-                // Shatai slants each glyph about its own em box centre first.
-                let turn = if ft.vertical { g.vertical_xf(l.baseline) } else { None };
-                let shatai = cs.styles.get(g.style as usize).and_then(|st| st.shatai_xf(g, l.baseline));
-                if turn.is_some() || shatai.is_some() {
-                    let m = turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY);
+        for (run, baseline, m) in drawn_runs(cs, ft) {
+            match m {
+                Some(m) => {
                     s.push_transform(&crate::export::tf(m));
-                    self.tagged_run(s, cs, &gs[i..i + 1], l.baseline, story);
+                    self.tagged_run(s, cs, run, baseline, story);
                     s.pop();
-                    i += 1;
-                    continue;
                 }
-                let j = run_end(ft, gs, i);
-                self.tagged_run(s, cs, &gs[i..j], l.baseline, story);
-                i = j;
+                None => self.tagged_run(s, cs, run, baseline, story),
             }
         }
         self.as_artifact(s, |me, s| {
@@ -628,10 +612,11 @@ fn run_origin(cs: &ComposedStory, g0: &PlacedGlyph, baseline: f64) -> (f64, f64,
     (g0.sy * g0.face.upem, tan, origin)
 }
 
-/// The outlines of a frame's visible glyphs in text space, turned and slanted as they are drawn:
-/// the silhouette a drop shadow on a frame without a fill casts.
-pub(crate) fn glyph_silhouette(cs: &ComposedStory, ft: &FrameText) -> BezPath {
-    let mut bp = BezPath::new();
+/// A frame's visible glyphs in the runs they are drawn in, each with its baseline and the
+/// transform a single glyph is drawn under: vertical type turns an upright glyph back a quarter
+/// about its em box centre, and shatai slants each glyph about its own em box centre first.
+fn drawn_runs<'a>(cs: &ComposedStory, ft: &'a FrameText) -> Vec<(&'a [PlacedGlyph], f64, Option<Affine>)> {
+    let mut runs = Vec::new();
     for l in &ft.lines {
         let gs = &l.glyphs;
         let mut i = 0;
@@ -642,17 +627,53 @@ pub(crate) fn glyph_silhouette(cs: &ComposedStory, ft: &FrameText) -> BezPath {
             }
             let turn = if ft.vertical { g.vertical_xf(l.baseline) } else { None };
             let shatai = cs.styles.get(g.style as usize).and_then(|st| st.shatai_xf(g, l.baseline));
-            let j = if turn.is_some() || shatai.is_some() { i + 1 } else { run_end(ft, gs, i) };
+            let (j, m) = if turn.is_some() || shatai.is_some() {
+                (i + 1, Some(turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY)))
+            } else {
+                (run_end(ft, gs, i), None)
+            };
             let Some(run) = gs.get(i..j) else { break };
-            let (size, tan, origin) = run_origin(cs, g, l.baseline);
-            let m = turn.unwrap_or(Affine::IDENTITY) * shatai.unwrap_or(Affine::IDENTITY) * origin;
-            let mut o = glyph_outlines(run, size, tan);
-            o.apply_affine(m);
-            bp.extend(o.iter());
+            runs.push((run, l.baseline, m));
             i = j;
         }
     }
+    runs
+}
+
+/// How deep notes and table cells nest in a silhouette (cells in notes in cells…).
+const MAX_SILHOUETTE_DEPTH: usize = 8;
+
+/// The outlines of a frame's visible glyphs in text space, its notes' and table cells' included,
+/// placed, turned and slanted as they are drawn: the silhouette a drop shadow on a frame without
+/// a fill casts. Rules, shading and anchored objects (drawn as items of their own) are not part
+/// of it.
+pub(crate) fn glyph_silhouette(cs: &ComposedStory, ft: &FrameText) -> BezPath {
+    let mut bp = BezPath::new();
+    add_silhouette(&mut bp, cs, ft, Affine::IDENTITY, 0);
     bp
+}
+
+fn add_silhouette(bp: &mut BezPath, cs: &ComposedStory, ft: &FrameText, xf: Affine, depth: usize) {
+    for (run, baseline, m) in drawn_runs(cs, ft) {
+        let Some(g0) = run.first() else { continue };
+        let (size, tan, origin) = run_origin(cs, g0, baseline);
+        let mut o = glyph_outlines(run, size, tan);
+        o.apply_affine(xf * m.unwrap_or(Affine::IDENTITY) * origin);
+        bp.extend(o.iter());
+    }
+    if depth >= MAX_SILHOUETTE_DEPTH {
+        return;
+    }
+    for n in &ft.notes {
+        if let Some(nft) = n.text.frames.first() {
+            add_silhouette(bp, &n.text, nft, xf * Affine::translate(n.origin.to_vec2()), depth + 1);
+        }
+    }
+    for cell in ft.tables.iter().flat_map(|t| &t.cells) {
+        if let Some(cft) = cell.text.frames.first() {
+            add_silhouette(bp, &cell.text, cft, xf * Affine::translate(cell.origin.to_vec2()), depth + 1);
+        }
+    }
 }
 
 /// A run's glyph outlines at `size`, relative to its first glyph's origin. A vertical offset (a

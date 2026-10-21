@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use designcraft_color::{Color, ColorType, Swatch, SwatchValue, swatch as sw};
 use designcraft_doc::{
-    Asset, AssetId, BASIC_PARAGRAPH, CharAttrs, CharacterStyle, Columns, Content, DocSettings, Document, Fill, FirstBaseline, Graphic, Guide, Item,
-    ItemId, Layer, LayerId, Margins, NumberStyle, Orientation, Page, PageId, PageSide, ParagraphStyle, ParentInfo, Section, Shape, Spread, SpreadId,
-    Story, StoryId, Stroke, Styles, TextFrame, TextFrameOptions, VerticalJustification,
+    Asset, AssetId, BASIC_PARAGRAPH, CharAttrs, CharFormat, CharacterStyle, Columns, Content, DocSettings, Document, Fill, FirstBaseline, Graphic,
+    Guide, Item, ItemId, Layer, LayerId, Margins, NumberStyle, Orientation, Page, PageId, PageSide, ParaFormat, ParagraphStyle, ParentInfo, Section,
+    Shape, Spread, SpreadId, Story, StoryId, Stroke, Styles, TextFrame, TextFrameOptions, VerticalJustification,
 };
 use designcraft_geom::{Affine, BezPath, PathData, Rect, Unit, shapes};
 
@@ -742,7 +742,7 @@ impl<'a> Importer<'a> {
             if b.truncated {
                 self.warnings.push("a story longer than 64 MB was cut short".into());
             }
-            let shadow = b.shadow();
+            let shadow = b.shadow(|f, p| run_size(&self.styles, f, p));
             let story = b.finish(sid);
             self.note_shadow(sid, shadow);
             let ids: Vec<i64> = chain.iter().filter_map(|i| frames.get(*i).map(|f| f.0)).collect();
@@ -889,7 +889,7 @@ impl<'a> Importer<'a> {
                         let sid = StoryId(self.alloc());
                         let mut b = StoryBuilder::new(&self.names);
                         b.read(e.find(&["StoryText"]).unwrap_or(e), &mut self.palette);
-                        let shadow = b.shadow();
+                        let shadow = b.shadow(|f, p| run_size(&self.styles, f, p));
                         self.stories.insert(sid, b.finish(sid));
                         self.note_shadow(sid, shadow);
                         self.loose_frames.push((sid, id));
@@ -1158,6 +1158,12 @@ impl<'a> Importer<'a> {
         d.check().map_err(|e| SlaError::Invalid(e.to_string()))?;
         Ok(Imported { document: d, warnings })
     }
+}
+
+/// The font size a run gets: its own, its character style's, its paragraph style's, the
+/// document default's, as DesignCraft resolves them.
+fn run_size(styles: &Styles, f: &CharFormat, p: &ParaFormat) -> f64 {
+    styles.resolve_char(&styles.resolve_para(p).1, f).size
 }
 
 /// `ItemType` (1.7) or `PTYPE`: 2 image, 4 text, 5 line, 6 polygon, 7 polyline, 8 text on a path,

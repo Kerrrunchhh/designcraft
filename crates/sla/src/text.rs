@@ -213,18 +213,28 @@ impl ShadowAttrs {
         }
     }
 
-    /// The shadow these attributes cast from text `size` points high, if they turn it on.
-    fn resolve(&self, size: f64, palette: &mut Palette<'_>) -> Option<TextShadow> {
+    /// The shadow these attributes cast, if they turn it on.
+    fn resolve(&self, palette: &mut Palette<'_>) -> Option<RunShadow> {
         if self.on != Some(true) {
             return None;
         }
-        Some(TextShadow {
-            dx: self.x.unwrap_or(5.0) / 100.0 * size,
-            dy: -self.y.unwrap_or(-5.0) / 100.0 * size,
+        Some(RunShadow {
+            x: self.x.unwrap_or(5.0),
+            y: self.y.unwrap_or(-5.0),
             color: palette.swatch(self.color.as_deref().unwrap_or("Black")),
             tint: shade(self.shade.unwrap_or(100.0)),
         })
     }
+}
+
+/// A run's text shadow before its size is known: offsets in percent of the font size (x to the
+/// right, y up), swatch and tint.
+#[derive(Clone, Debug, PartialEq)]
+struct RunShadow {
+    x: f64,
+    y: f64,
+    color: String,
+    tint: f32,
 }
 
 /// A run's text shadow: offset in points in the frame's text space (y down), swatch and tint.
@@ -312,7 +322,7 @@ struct Para {
 struct Run {
     text: String,
     format: CharFormat,
-    shadow: Option<TextShadow>,
+    shadow: Option<RunShadow>,
     para: usize,
 }
 
@@ -358,7 +368,7 @@ impl<'a> StoryBuilder<'a> {
                 "ITEXT" | "Content" => {
                     let chars = e.any(&["Chars", "CH"]).unwrap_or("");
                     let format = self.run_format(e, palette);
-                    let shadow = self.run_shadow(e, &format, palette);
+                    let shadow = self.run_shadow(e, palette);
                     // Old files can hold paragraph separators inside the run.
                     let mut first = true;
                     for piece in chars.split(['\r', '\n', '\u{2029}']) {
@@ -419,23 +429,23 @@ impl<'a> StoryBuilder<'a> {
 
     /// The shadow a run casts: the document default's, its character style's, the story
     /// default's and its own attributes in turn.
-    fn run_shadow(&self, e: &El, format: &CharFormat, palette: &mut Palette<'_>) -> Option<TextShadow> {
+    fn run_shadow(&self, e: &El, palette: &mut Palette<'_>) -> Option<RunShadow> {
         let mut attrs = self.names.base_shadow.clone();
         if let Some(style) = e.any(&["CParent", "CPARENT"]).and_then(|p| self.names.char_shadows.get(p)) {
             attrs.merge(style);
         }
         attrs.merge(&self.base_shadow);
         attrs.merge(&ShadowAttrs::read(e));
-        attrs.resolve(format.over.size.unwrap_or(12.0), palette)
+        attrs.resolve(palette)
     }
 
     fn push_special(&mut self, e: &El, s: &str, palette: &mut Palette<'_>) {
         let format = self.run_format(e, palette);
-        let shadow = self.run_shadow(e, &format, palette);
+        let shadow = self.run_shadow(e, palette);
         self.push(s, &format, shadow.as_ref());
     }
 
-    fn push(&mut self, s: &str, format: &CharFormat, shadow: Option<&TextShadow>) {
+    fn push(&mut self, s: &str, format: &CharFormat, shadow: Option<&RunShadow>) {
         if s.is_empty() || self.truncated {
             return;
         }
@@ -481,23 +491,28 @@ impl<'a> StoryBuilder<'a> {
         self.runs.is_empty()
     }
 
-    /// How the story's visible text is shadowed.
-    pub fn shadow(&self) -> StoryShadow {
+    /// How the story's visible text is shadowed. `size_of` gives a run's font size from its
+    /// character format and its paragraph's format (styles included).
+    pub fn shadow(&self, size_of: impl Fn(&CharFormat, &ParaFormat) -> f64) -> StoryShadow {
         let mut visible = 0usize;
-        let mut shadows: Vec<(&TextShadow, usize)> = Vec::new();
+        let mut shadows: Vec<(TextShadow, usize)> = Vec::new();
         for r in &self.runs {
             let n = r.text.chars().filter(|c| !c.is_whitespace() && !c.is_control()).count();
             visible = visible.saturating_add(n);
-            let Some(sh) = r.shadow.as_ref().filter(|_| n > 0) else { continue };
+            let Some(rs) = r.shadow.as_ref().filter(|_| n > 0) else { continue };
+            // Paragraphs still without a format take the story default when the story is finished.
+            let para = self.paras.get(r.para).and_then(|p| p.format.as_ref()).unwrap_or(&self.base_para);
+            let size = size_of(&r.format, para);
+            let sh = TextShadow { dx: rs.x / 100.0 * size, dy: -rs.y / 100.0 * size, color: rs.color.clone(), tint: rs.tint };
             match shadows.iter_mut().find(|(s, _)| *s == sh) {
                 Some((_, count)) => *count = count.saturating_add(n),
                 None => shadows.push((sh, n)),
             }
         }
-        let shadowed: usize = shadows.iter().map(|(_, n)| n).sum();
-        match shadows.iter().max_by_key(|(_, n)| *n) {
+        let shadowed = shadows.iter().fold(0usize, |a, (_, n)| a.saturating_add(*n));
+        match shadows.into_iter().max_by_key(|(_, n)| *n) {
             None => StoryShadow::None,
-            Some((sh, _)) if shadowed == visible => StoryShadow::All((*sh).clone()),
+            Some((sh, _)) if shadowed == visible => StoryShadow::All(sh),
             Some(_) => StoryShadow::Partial,
         }
     }

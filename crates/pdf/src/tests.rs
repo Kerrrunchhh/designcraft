@@ -488,6 +488,24 @@ fn a_text_frame_without_a_fill_casts_the_shadow_of_its_text() {
 }
 
 #[test]
+fn a_text_shadow_covers_the_frames_footnotes() {
+    // The footnote sits at the foot of the frame, far below the body line: the silhouette
+    // reaches down there too.
+    use designcraft_geom::kurbo::Shape as _;
+    let silhouette = |note: bool| {
+        let mut d = doc_with_text("Body");
+        let body = *d.stories.keys().next().unwrap();
+        if note {
+            d.story_mut(body).unwrap().insert_note(4, "Footnote text", ParaFormat::default());
+        }
+        let cs = Cache::new().get(&d, body, None);
+        crate::text::glyph_silhouette(&cs, &cs.frames[0]).bounding_box()
+    };
+    let (body, with_note) = (silhouette(false), silhouette(true));
+    assert!(with_note.height() > body.height() + 100.0, "{body:?} vs {with_note:?}");
+}
+
+#[test]
 fn stroke_behind_fill_strokes_the_run_before_filling_it() {
     let export = |behind: bool| {
         let mut d = doc_with_text("I");

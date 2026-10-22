@@ -256,28 +256,39 @@ pub fn specs() -> Vec<CommandSpec> {
             st.bump_revision();
             ok()
         }),
-        cmd!("edit.clear", "Clear", ["Edit"], Some("Delete"), "{ids?} — delete selected items (or the selected text)", has_doc, |s, p| {
-            if s.doc()?.selection.text.is_some() && p.get("ids").is_none() {
-                return super::text::delete_selection(s);
-            }
-            let ids = super::targets(s, p)?;
-            // With a placed graphic itself selected (Direct Selection), only the graphic goes: its
-            // frame stays, empty and selected (as in InDesign). Other items are deleted.
-            let content = s.doc()?.selection.content && p.get("ids").is_none();
-            s.edit(|d, sel| {
-                let mut kept = Vec::new();
-                for id in &ids {
-                    if let Some(it) = d.item_mut(*id).filter(|it| content && matches!(it.content, designcraft_doc::Content::Graphic(_))) {
-                        it.content = designcraft_doc::Content::Unassigned;
-                        kept.push(*id);
-                    } else {
-                        let _ = d.remove_item(*id);
-                    }
+        cmd!(
+            "edit.clear",
+            "Clear",
+            ["Edit"],
+            Some("Delete"),
+            "{ids?} — delete selected items (or the selected text or ruler guides)",
+            has_doc,
+            |s, p| {
+                if s.doc()?.selection.text.is_some() && p.get("ids").is_none() {
+                    return super::text::delete_selection(s);
                 }
-                *sel = Selection::items(kept);
-                Ok(json!({"deleted": ids.len()}))
-            })
-        }),
+                if p.get("ids").is_none() && s.doc()?.selection.items.is_empty() && !s.doc()?.selection.guides.is_empty() {
+                    return s.execute("guide.delete", &json!({}));
+                }
+                let ids = super::targets(s, p)?;
+                // With a placed graphic itself selected (Direct Selection), only the graphic goes: its
+                // frame stays, empty and selected (as in InDesign). Other items are deleted.
+                let content = s.doc()?.selection.content && p.get("ids").is_none();
+                s.edit(|d, sel| {
+                    let mut kept = Vec::new();
+                    for id in &ids {
+                        if let Some(it) = d.item_mut(*id).filter(|it| content && matches!(it.content, designcraft_doc::Content::Graphic(_))) {
+                            it.content = designcraft_doc::Content::Unassigned;
+                            kept.push(*id);
+                        } else {
+                            let _ = d.remove_item(*id);
+                        }
+                    }
+                    *sel = Selection::items(kept);
+                    Ok(json!({"deleted": ids.len()}))
+                })
+            }
+        ),
         cmd!(noundo "edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{} → {text} when text is selected (with formatting, footnotes, markers)", has_selection_or_text, |s, _| {
             if let Some(text) = copy_text(s)? {
                 return Ok(json!({"text": text}));
